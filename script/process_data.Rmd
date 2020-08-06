@@ -1,0 +1,631 @@
+---
+title: "process isoform dataset"
+output: html_notebook
+---
+
+```{r,warning=FALSE,message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(formattable)
+```
+
+```{r}
+sample_list = list("CLL2"="data/PromethION_CLL2/FLTSA_output/",
+                   "scmixology1"="data/PromethION_scmixology1/FLTSA_output/",
+                   "scmixology2"="data/PromethION_scmixology2/FLTSA_output/",
+                   "MuSC"="data/PromethION_MSC/FLTSA_output/")
+sample_list
+sample_names = c('scmixology1',"scmixology2","MuSC","CLL2")
+```
+
+
+
+```{r}
+get_summary_SQANTI2 = function(data_dir,experiment,min_cnt_keep=10){
+  cat_select = c("full-splice_match","incomplete-splice_match","novel_in_catalog","novel_not_in_catalog")
+  transcript_assembly_classification <- read.delim(file.path(data_dir,"transcript_assembly_classification.txt.gz"),stringsAsFactors = FALSE)
+  transcript_count <- read.csv(file.path(data_dir,"transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  
+  tr_cnt_sum = rowSums(transcript_count[,-c(1,2)])
+  tr_cell_sum = colSums(transcript_count[,-c(1,2)]>0)
+  tr_cell_sum = tr_cell_sum[tr_cell_sum<(quantile(tr_cell_sum,0.99)+median(tr_cell_sum))]
+  tr_cell_sum = tr_cell_sum[tr_cell_sum>quantile(tr_cell_sum,0.01)]
+  tr_cell_df = data.frame(experiment=rep(experiment,length(tr_cell_sum)),num_of_transcript=unname(tr_cell_sum))
+  
+  tr_sum_df = data.frame(transcript_id=transcript_count$transcript_id,
+                         gene_id=transcript_count$gene_id,
+                         total_count=tr_cnt_sum, stringsAsFactors=FALSE)
+  
+  tr_sum_df = tr_sum_df[tr_sum_df$total_count>min_cnt_keep,]
+  
+  tr_freq_df = as.data.frame(table(table(tr_sum_df$gene_id)))
+  tr_freq_df$Var1 = as.numeric(tr_freq_df$Var1)
+  l5 = sum(tr_freq_df$Freq[tr_freq_df$Var1>5])
+  tr_freq_df = tr_freq_df[tr_freq_df$Var1<7,]
+  tr_freq_df$Freq[tr_freq_df$Var1==6] = l5
+  colnames(tr_freq_df) = c("number_of_isoforms","Frequency")
+  
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$isoform %in% tr_sum_df$transcript_id,]
+  
+  tr_classification = transcript_assembly_classification[,c("isoform","length","structural_category","subcategory","coding","within_cage_peak")]
+  
+  tr_merge_df = merge(tr_sum_df,tr_classification,by.x="transcript_id",by.y="isoform")
+  plt_df = tr_merge_df %>% group_by(structural_category) %>% summarise(total_count=sum(total_count))
+  plt_df = plt_df[plt_df$structural_category %in% cat_select,]
+  plt_df$experiment = experiment
+  plt_df2 = as.data.frame(table(tr_classification$structural_category))
+  plt_df2 = plt_df2[plt_df2$Var1 %in% cat_select,]
+  colnames(plt_df2) = c("structural_category","num_of_transcript")
+  plt_df2$experiment = experiment
+  
+  tmp_df = tr_merge_df %>% group_by(structural_category,within_cage_peak) %>% summarise(total_count=sum(total_count))
+  tmp_df=tmp_df[tmp_df$structural_category %in% cat_select,]
+  tmp_df$experiment = experiment
+  
+  tmp_df2 = as.data.frame(table(tr_classification$structural_category,tr_classification$within_cage_peak))
+  tmp_df2 = tmp_df2[tmp_df2$Var1 %in% cat_select,]
+  colnames(tmp_df2) = c("structural_category","within_cage_peak","num_of_transcript")
+  tmp_df2$experiment = experiment
+  
+  transcript_assembly_junctions <- read.delim(file.path(data_dir,"transcript_assembly_junctions.txt.gz"),stringsAsFactors = FALSE)
+  transcript_assembly_junctions = transcript_assembly_junctions[transcript_assembly_junctions$isoform %in% transcript_assembly_classification$isoform,]
+  transcript_assembly_junctions = transcript_assembly_junctions[transcript_assembly_junctions$junction_category=="novel",]
+  if(!any(is.na(transcript_assembly_junctions$sample_with_cov))){
+    jun_df = as.data.frame(table(transcript_assembly_junctions$sample_with_cov))
+    colnames(jun_df) = c("within_intropolis_dataset","num_of_junctions")
+    jun_df$experiment = experiment
+    
+    return(list(tr_cnt=plt_df,
+                tr_num=plt_df2,
+                cage_cnt=tmp_df,
+                tr_cell_df=tr_cell_df,
+                tr_freq_df=tr_freq_df,
+                cage_num=tmp_df2,
+                jun_num=jun_df))
+  }else{
+    return(list(tr_cnt=plt_df,
+              tr_num=plt_df2,
+              cage_cnt=tmp_df,
+              cage_num=tmp_df2,
+              tr_freq_df=tr_freq_df,
+              tr_cell_df=tr_cell_df,
+              jun_num=NA))
+  }
+
+}
+
+```
+
+
+```{r}
+res_list = list()
+
+
+
+for (smp in names(sample_list)){
+  print(smp)
+  res_list[[smp]] =  get_summary_SQANTI2(sample_list[[smp]],smp)
+}
+
+#saveRDS(res_list,file="data/processed_files/tr_classification.Rds")
+```
+
+```{r}
+cat_color = c("#ED4E31","#FFC000","#70AD7A","#6C72C4")
+```
+
+
+```{r}
+tmp_func = function(x){
+  x$tr_cnt$total_count = x$tr_cnt$total_count/sum(x$tr_cnt$total_count)
+  return(x$tr_cnt)
+}
+isoform_cat = Reduce(rbind,lapply(res_list,tmp_func))
+isoform_cat$experiment <- factor(isoform_cat$experiment,
+                             levels = sample_names,ordered = TRUE)
+
+ggplot(data=isoform_cat,aes(x=experiment,y=total_count,fill=structural_category))+
+  geom_bar(stat="identity",alpha=0.9)+
+  labs(x="",y="percentage of UMI counts")+
+  scale_fill_manual(values =cat_color )+
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/categories_by_counts_pct.pdf",width = 4.5,height = 3)
+```
+
+
+```{r}
+tmp_func = function(x){
+  return(x$tr_cnt)
+}
+isoform_cat = Reduce(rbind,lapply(res_list,tmp_func))
+isoform_cat$experiment <- factor(isoform_cat$experiment,
+                             levels =sample_names,ordered = TRUE)
+
+ggplot(data=isoform_cat,aes(x=experiment,y=total_count,fill=structural_category))+
+  geom_bar(stat="identity",alpha=0.9)+
+  labs(x="",y="number UMI counts")+
+  scale_fill_manual(values = cat_color)+
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/categories_by_counts.pdf",width = 6,height = 3.5)
+```
+
+
+```{r}
+tmp_func = function(x){
+  x$tr_num$num_of_transcript = x$tr_num$num_of_transcript/sum(x$tr_num$num_of_transcript)
+  return(x$tr_num)
+}
+isoform_cat = Reduce(rbind,lapply(res_list,tmp_func))
+isoform_cat$experiment <- factor(isoform_cat$experiment,
+                             levels = sample_names,ordered = TRUE)
+
+ggplot(data=isoform_cat,aes(x=experiment,y=num_of_transcript,fill=structural_category))+
+  geom_bar(stat="identity",alpha=0.9)+
+  labs(x="",y="number of transcripts")+
+  scale_fill_manual(values = cat_color)+
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/categories_by_numbers_pct.pdf",width = 4.5,height = 3)
+```
+
+
+```{r}
+tmp_func = function(x){
+  return(x$tr_num)
+}
+isoform_cat = Reduce(rbind,lapply(res_list,tmp_func))
+isoform_cat$experiment <- factor(isoform_cat$experiment,
+                             levels = sample_names,ordered = TRUE)
+
+ggplot(data=isoform_cat,aes(x=experiment,y=num_of_transcript,fill=structural_category))+
+  geom_bar(stat="identity",alpha=0.9)+
+  labs(x="",y="number of transcripts")+
+  scale_fill_manual(values = cat_color)+
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/categories_by_numbers.pdf",width = 4.5,height = 3)
+```
+
+
+```{r}
+tmp_func = function(x){
+  x$cage_cnt$total_count = x$cage_cnt$total_count/sum(x$cage_cnt$total_count)
+  x$cage_cnt %>% group_by(within_cage_peak,experiment) %>% summarise(total_count=sum(total_count))
+}
+cage_cat = Reduce(rbind,lapply(res_list,tmp_func))
+cage_cat$experiment <- factor(cage_cat$experiment,
+                             levels = sample_names,ordered = TRUE)
+
+ggplot(data=cage_cat,aes(x=experiment,y=total_count,fill=within_cage_peak))+
+  geom_bar(stat="identity",alpha=0.7)+
+  #scale_fill_brewer(palette ="Set1",direction = -1)+
+  scale_fill_manual(values = c("cadetblue3","darkred"))+
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/withincage_cnt_pct.pdf",width = 4,height = 3)
+```
+
+```{r}
+tmp_func = function(x){
+  x$cage_num$num_of_transcript = x$cage_num$num_of_transcript/sum(x$cage_num$num_of_transcript)
+  x$cage_num %>% group_by(within_cage_peak,experiment) %>% summarise(num_of_transcript=sum(num_of_transcript))
+}
+cage_cat = Reduce(rbind,lapply(res_list,tmp_func))
+cage_cat$experiment <- factor(cage_cat$experiment,
+                             levels = sample_names,ordered = TRUE)
+
+ggplot(data=cage_cat,aes(x=experiment,y=num_of_transcript,fill=within_cage_peak))+
+  geom_bar(stat="identity",alpha=0.7)+
+  scale_fill_manual(values = c("cadetblue3","darkred"))+
+  theme_bw()+
+  theme(legend.position="top",axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/withincage_num_pct.pdf",width = 3,height = 3)
+```
+
+
+```{r}
+tmp_func = function(x){
+  if(is.na(x$jun_num)){
+    return(NA)
+  }
+  x$jun_num$num_of_junctions = x$jun_num$num_of_junctions/sum(x$jun_num$num_of_junctions)
+  x$jun_num
+}
+junc_cat =  Reduce(rbind,lapply(res_list,tmp_func))
+junc_cat = junc_cat[!is.na(junc_cat$within_intropolis_dataset),]
+junc_cat$experiment <- factor(junc_cat$experiment,
+                             levels = sample_names,ordered = TRUE)
+
+ggplot(data=junc_cat,aes(x=experiment,y=num_of_junctions,fill=within_intropolis_dataset))+
+  geom_bar(stat="identity",alpha=0.7)+
+  scale_fill_manual(values = c("cadetblue3","darkred"))+
+  labs(y="percentage of junction sites")+
+  theme_bw()+
+  theme(legend.position="top",axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+#ggsave("figs/junc_intropolis_num_pct.pdf",width = 3,height = 3)
+```
+
+
+```{r}
+tmp_func = function(smp){
+  res_list[[smp]]$tr_freq_df$experiment = smp
+  res_list[[smp]]$tr_freq_df
+}
+tr_freq =  Reduce(rbind,lapply(names(res_list),tmp_func))
+tr_freq$number_of_isoforms = as.factor(tr_freq$number_of_isoforms)
+levels(tr_freq$number_of_isoforms) <- c(1:5,">5")
+tr_freq$experiment <- factor(tr_freq$experiment,
+                             levels = sample_names,ordered = TRUE)
+
+ggplot(data=tr_freq,aes(x=number_of_isoforms,y=Frequency,fill=experiment))+
+  geom_bar(stat="identity",alpha=0.9,position="dodge")+
+  scale_fill_brewer(palette ="Set2",direction = -1)+
+  labs(x="number of isoforms per gene",fill="")+
+  theme_bw()+
+  theme(legend.position="top",
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/isoform_number_per_gene.pdf",width = 5,height = 3)
+```
+# umap visualization of isoform category
+
+## CLL2
+
+```{r}
+data_dir = sample_list[[1]]
+  transcript_assembly_classification <- read.delim(file.path(data_dir,"transcript_assembly_classification.txt.gz"),stringsAsFactors = FALSE)
+  transcript_count <- read.csv(file.path(data_dir,"transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  rownames(transcript_count) = transcript_count$transcript_id
+  transcript_count = transcript_count[,-c(1,2)]
+  tr_cell_sum = colSums(transcript_count)
+  transcript_count = transcript_count[,tr_cell_sum>quantile(tr_cell_sum,0.05) & tr_cell_sum<quantile(tr_cell_sum,0.99)]
+  transcript_count = transcript_count[rowSums(transcript_count>0)>10,]
+  
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$isoform %in% rownames(transcript_count),]
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$structural_category %in% c("full-splice_match","incomplete-splice_match","novel_in_catalog","novel_not_in_catalog"),]
+  transcript_count = transcript_count[rownames(transcript_count) %in% transcript_assembly_classification$isoform,]
+  transcript_count$isoform = rownames(transcript_count)
+  tr_classification = transcript_assembly_classification[,c("isoform","length","structural_category","subcategory","coding","within_cage_peak")]
+  
+  tr_cla_cnt = tr_classification %>% left_join(transcript_count,by=c("isoform"="isoform"))
+  cell_id = colnames(tr_cla_cnt)[!(colnames(tr_cla_cnt) %in% c("isoform","length","structural_category","subcategory","coding","within_cage_peak") )]
+  tr_cla_cnt_l = tr_cla_cnt %>% gather(cell_name, cnt,cell_id)
+  tr_cla_cnt_l = tr_cla_cnt_l[tr_cla_cnt_l$cnt>0,]
+  tr_wide_cat = tr_cla_cnt_l %>% pivot_wider(id_cols=structural_category, names_from=cell_name,values_from=cnt,values_fn=sum)
+  tr_wide_cat = as.data.frame(tr_wide_cat)
+  rownames(tr_wide_cat) = tr_wide_cat$structural_category
+  tr_wide_cat = tr_wide_cat[,-1]
+  tr_wide_cat = t(t(tr_wide_cat)/colSums(tr_wide_cat))
+  colnames(tr_wide_cat) = paste(colnames(tr_wide_cat),"1",sep="-")
+```
+
+```{r}
+CLL2_lib20_srt <- readRDS("~/Dropbox/research/sc_longread/Rachel/short_reads/CLL2_lib20_srt.Rds")
+DimPlot(CLL2_lib20_srt,label = T)
+```
+```{r}
+CLL2_lib20_srt$cell_type = "CLL"
+CLL2_lib20_srt$cell_type[CLL2_lib20_srt$seurat_clusters %in% c(5,9)] = "normal"
+tr_wide_cat = tr_wide_cat[,colnames(tr_wide_cat) %in% colnames(CLL2_lib20_srt)]
+```
+
+```{r}
+glist = list()
+for (ix in 1:4) {
+  plot_df = data.frame(Dim1=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(tr_wide_cat),1],
+                         Dim2=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(tr_wide_cat),2],
+                         expression=(tr_wide_cat[ix,]))
+plot_df$expression[plot_df$expression>quantile(plot_df$expression,0.99)] = quantile(plot_df$expression,0.99)
+plot_df$expression[plot_df$expression<quantile(plot_df$expression,0.01)] = quantile(plot_df$expression,0.01)
+plot_df$expression = scale(plot_df$expression)
+plot_df$expression[plot_df$expression>2.5] = 2.5
+plot_df$expression[plot_df$expression<(-2.5)] = -2.5
+glist[[ix]] =   ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=0.5)+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint = median(plot_df$expression))+
+      theme_bw()+
+      labs(col="relative proportions",title=rownames(tr_wide_cat)[ix])+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+}
+
+ggarrange(plotlist = glist,common.legend = T,legend = "right")
+ggsave("figs/umap_CLL2_tr_cat_summary.pdf",width = 5.5,height = 5)
+```
+
+```{r}
+tr_l_cat = as.data.frame(t(tr_wide_cat))
+tr_l_cat$cell_type = CLL2_lib20_srt@meta.data[rownames(tr_l_cat),"cell_type"]
+tr_l_cat = tr_l_cat %>% gather(cat,pct,1:4)
+
+ggplot(data=tr_l_cat[tr_l_cat$cat=="novel_not_in_catalog",],aes(x=cell_type,y=pct,fill=cell_type))+
+  geom_boxplot(show.legend = F,alpha=0.5)+
+  scale_fill_brewer(palette = "Set2")+
+  labs(x="",y="percentage of counts")+
+  stat_compare_means(label.x = 1.5)+
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"))
+ggsave("figs/boxplot_CLL2_NNC.pdf",width = 1.5,height = 3)
+```
+
+
+```{r}
+glist[[2]]+theme(legend.position = "none")
+ggsave("figs/umap_CLL2_NIC.pdf",width = 3,height = 3)
+```
+
+
+```{r}
+glist[[1]]+theme(legend.position = "none")
+ggsave("figs/umap_CLL2_NNC.pdf",width = 3,height = 3)
+```
+
+```{r}
+glist[[3]]+theme(legend.position = "none")
+ggsave("figs/umap_CLL2_FSM.pdf",width = 3,height = 3)
+```
+
+## MuSC
+
+```{r}
+data_dir = sample_list[[4]]
+  transcript_assembly_classification <- read.delim(file.path(data_dir,"transcript_assembly_classification.txt.gz"),stringsAsFactors = FALSE)
+  transcript_count <- read.csv(file.path(data_dir,"transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  rownames(transcript_count) = transcript_count$transcript_id
+  transcript_count = transcript_count[,-c(1,2)]
+  tr_cell_sum = colSums(transcript_count)
+  transcript_count = transcript_count[,tr_cell_sum>quantile(tr_cell_sum,0.05) & tr_cell_sum<quantile(tr_cell_sum,0.99)]
+  transcript_count = transcript_count[rowSums(transcript_count>0)>10,]
+  
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$isoform %in% rownames(transcript_count),]
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$structural_category %in% c("full-splice_match","incomplete-splice_match","novel_in_catalog","novel_not_in_catalog"),]
+  transcript_count = transcript_count[rownames(transcript_count) %in% transcript_assembly_classification$isoform,]
+  transcript_count$isoform = rownames(transcript_count)
+  tr_classification = transcript_assembly_classification[,c("isoform","length","structural_category","subcategory","coding","within_cage_peak")]
+  
+  tr_cla_cnt = tr_classification %>% left_join(transcript_count,by=c("isoform"="isoform"))
+  cell_id = colnames(tr_cla_cnt)[!(colnames(tr_cla_cnt) %in% c("isoform","length","structural_category","subcategory","coding","within_cage_peak") )]
+  tr_cla_cnt_l = tr_cla_cnt %>% gather(cell_name, cnt,cell_id)
+  tr_cla_cnt_l = tr_cla_cnt_l[tr_cla_cnt_l$cnt>0,]
+  tr_wide_cat = tr_cla_cnt_l %>% pivot_wider(id_cols=structural_category, names_from=cell_name,values_from=cnt,values_fn=sum)
+  tr_wide_cat = as.data.frame(tr_wide_cat)
+  rownames(tr_wide_cat) = tr_wide_cat$structural_category
+  tr_wide_cat = tr_wide_cat[,-1]
+  tr_wide_cat = t(t(tr_wide_cat)/colSums(tr_wide_cat))
+ # colnames(tr_wide_cat) = paste(colnames(tr_wide_cat),"1",sep="-")
+```
+
+```{r}
+srt_msc = readRDS("~/Dropbox/research/sc_longread/manuscript/analysis/data/processed_files/srt_msc.Rds")
+srt_msc = RunUMAP(srt_msc,dims = 1:20)
+DimPlot(srt_msc,label = T)
+```
+```{r}
+tr_wide_cat = tr_wide_cat[,colnames(tr_wide_cat) %in% srt_msc$barcode_seq]
+```
+
+
+```{r}
+glist = list()
+for (ix in 1:4) {
+  plot_df = data.frame(Dim1=srt_msc@reductions$umap@cell.embeddings[match(colnames(tr_wide_cat), srt_msc$barcode_seq),1],
+                         Dim2=srt_msc@reductions$umap@cell.embeddings[match(colnames(tr_wide_cat), srt_msc$barcode_seq),2],
+                         expression=(tr_wide_cat[ix,]))
+plot_df$expression[plot_df$expression>quantile(plot_df$expression,0.99)] = quantile(plot_df$expression,0.99)
+plot_df$expression[plot_df$expression<quantile(plot_df$expression,0.01)] = quantile(plot_df$expression,0.01)
+plot_df$expression = scale(plot_df$expression)
+plot_df$expression[plot_df$expression>2.5] = 2.5
+plot_df$expression[plot_df$expression<(-2.5)] = -2.5
+glist[[ix]] =   ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=1.3)+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint = median(plot_df$expression))+
+      theme_bw()+
+      labs(col="relative proportions",title=rownames(tr_wide_cat)[ix])+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+}
+
+ggarrange(plotlist = glist,common.legend = T,legend = "right")
+ggsave("figs/umap_MuSC_tr_cat_summary.pdf",width = 5.5,height = 5)
+```
+
+```{r}
+ glist[[4]]+theme(legend.position = "none")
+ggsave("figs/umap_MuSC_NIC.pdf",width = 3,height = 3)
+```
+
+```{r}
+glist[[1]]+theme(legend.position = "none")
+ggsave("figs/umap_MuSC_FSM.pdf",width = 3,height = 3)
+```
+
+
+```{r}
+glist[[3]]+theme(legend.position = "none")
+ggsave("figs/umap_MuSC_NNC.pdf",width = 3,height = 3)
+```
+
+## scmix1
+
+```{r}
+data_dir = sample_list[[2]]
+  transcript_assembly_classification <- read.delim(file.path(data_dir,"transcript_assembly_classification.txt.gz"),stringsAsFactors = FALSE)
+  transcript_count <- read.csv(file.path(data_dir,"transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  rownames(transcript_count) = transcript_count$transcript_id
+  transcript_count = transcript_count[,-c(1,2)]
+  tr_cell_sum = colSums(transcript_count)
+  transcript_count = transcript_count[,tr_cell_sum>quantile(tr_cell_sum,0.05) & tr_cell_sum<quantile(tr_cell_sum,0.99)]
+  transcript_count = transcript_count[rowSums(transcript_count>0)>10,]
+  
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$isoform %in% rownames(transcript_count),]
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$structural_category %in% c("full-splice_match","incomplete-splice_match","novel_in_catalog","novel_not_in_catalog"),]
+  transcript_count = transcript_count[rownames(transcript_count) %in% transcript_assembly_classification$isoform,]
+  transcript_count$isoform = rownames(transcript_count)
+  tr_classification = transcript_assembly_classification[,c("isoform","length","structural_category","subcategory","coding","within_cage_peak")]
+  
+  tr_cla_cnt = tr_classification %>% left_join(transcript_count,by=c("isoform"="isoform"))
+  cell_id = colnames(tr_cla_cnt)[!(colnames(tr_cla_cnt) %in% c("isoform","length","structural_category","subcategory","coding","within_cage_peak") )]
+  tr_cla_cnt_l = tr_cla_cnt %>% gather(cell_name, cnt,cell_id)
+  tr_cla_cnt_l = tr_cla_cnt_l[tr_cla_cnt_l$cnt>0,]
+  tr_wide_cat = tr_cla_cnt_l %>% pivot_wider(id_cols=structural_category, names_from=cell_name,values_from=cnt,values_fn=sum)
+  tr_wide_cat = as.data.frame(tr_wide_cat)
+  rownames(tr_wide_cat) = tr_wide_cat$structural_category
+  tr_wide_cat = tr_wide_cat[,-1]
+  tr_wide_cat = t(t(tr_wide_cat)/colSums(tr_wide_cat))
+ # colnames(tr_wide_cat) = paste(colnames(tr_wide_cat),"1",sep="-")
+```
+
+
+```{r}
+scmix1_srt <- readRDS("data/processed_files/scmix1_srt.Rds")
+scmix1_srt = RunPCA(scmix1_srt)
+scmix1_srt = FindNeighbors(scmix1_srt, dims = 1:10)
+scmix1_srt = RunUMAP(scmix1_srt,dims = 1:10)
+DimPlot(scmix1_srt,group.by = "cell_type")
+```
+```{r}
+tr_wide_cat = tr_wide_cat[,colnames(tr_wide_cat) %in% colnames(scmix1_srt)]
+```
+
+
+```{r}
+glist = list()
+for (ix in 1:4) {
+  plot_df = data.frame(Dim1=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_wide_cat),1],
+                         Dim2=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_wide_cat),2],
+                         expression=(tr_wide_cat[ix,]))
+plot_df$expression[plot_df$expression>quantile(plot_df$expression,0.99)] = quantile(plot_df$expression,0.99)
+plot_df$expression[plot_df$expression<quantile(plot_df$expression,0.01)] = quantile(plot_df$expression,0.01)
+plot_df$expression = scale(plot_df$expression)
+glist[[ix]] =   ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=0.8)+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint = median(plot_df$expression))+
+      theme_bw()+
+      labs(col="relative proportions",title=rownames(tr_wide_cat)[ix])+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+}
+
+ggarrange(plotlist = glist,common.legend = T,legend = "right")
+ggsave("figs/umap_scmix1_tr_cat_summary.pdf",width = 5.5,height = 5)
+```
+
+
+```{r}
+ glist[[2]]+theme(legend.position = "none")
+ggsave("figs/umap_scmix1_ISM.pdf",width = 3,height = 3)
+```
+
+```{r}
+ glist[[4]]+theme(legend.position = "none")
+ggsave("figs/umap_scmix1_NNC.pdf",width = 3,height = 3)
+```
+
+
+## scmix2
+
+```{r}
+data_dir = sample_list[[3]]
+  transcript_assembly_classification <- read.delim(file.path(data_dir,"transcript_assembly_classification.txt.gz"),stringsAsFactors = FALSE)
+  transcript_count <- read.csv(file.path(data_dir,"transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  rownames(transcript_count) = transcript_count$transcript_id
+  transcript_count = transcript_count[,-c(1,2)]
+  tr_cell_sum = colSums(transcript_count)
+  transcript_count = transcript_count[,tr_cell_sum>quantile(tr_cell_sum,0.05) & tr_cell_sum<quantile(tr_cell_sum,0.99)]
+  transcript_count = transcript_count[rowSums(transcript_count>0)>10,]
+  
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$isoform %in% rownames(transcript_count),]
+  transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$structural_category %in% c("full-splice_match","incomplete-splice_match","novel_in_catalog","novel_not_in_catalog"),]
+  transcript_count = transcript_count[rownames(transcript_count) %in% transcript_assembly_classification$isoform,]
+  transcript_count$isoform = rownames(transcript_count)
+  tr_classification = transcript_assembly_classification[,c("isoform","length","structural_category","subcategory","coding","within_cage_peak")]
+  
+  tr_cla_cnt = tr_classification %>% left_join(transcript_count,by=c("isoform"="isoform"))
+  cell_id = colnames(tr_cla_cnt)[!(colnames(tr_cla_cnt) %in% c("isoform","length","structural_category","subcategory","coding","within_cage_peak") )]
+  tr_cla_cnt_l = tr_cla_cnt %>% gather(cell_name, cnt,cell_id)
+  tr_cla_cnt_l = tr_cla_cnt_l[tr_cla_cnt_l$cnt>0,]
+  tr_wide_cat = tr_cla_cnt_l %>% pivot_wider(id_cols=structural_category, names_from=cell_name,values_from=cnt,values_fn=sum)
+  tr_wide_cat = as.data.frame(tr_wide_cat)
+  rownames(tr_wide_cat) = tr_wide_cat$structural_category
+  tr_wide_cat = tr_wide_cat[,-1]
+  tr_wide_cat = t(t(tr_wide_cat)/colSums(tr_wide_cat))
+  colnames(tr_wide_cat) = paste(colnames(tr_wide_cat),"1",sep="-")
+```
+
+
+```{r}
+scmix1_srt <- readRDS("data/processed_files/scmix2_srt.Rds")
+scmix1_srt = scmix1_srt[,scmix1_srt$nFeature_RNA>5000]
+scmix1_srt = RunPCA(scmix1_srt)
+scmix1_srt = FindNeighbors(scmix1_srt, dims = 1:10)
+scmix1_srt = RunUMAP(scmix1_srt,dims = 1:10)
+DimPlot(scmix1_srt,group.by = "cell_type")
+```
+
+```{r}
+tr_wide_cat = tr_wide_cat[,colnames(tr_wide_cat) %in% colnames(scmix1_srt)]
+```
+
+
+```{r}
+glist = list()
+for (ix in 1:4) {
+  plot_df = data.frame(Dim1=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_wide_cat),1],
+                         Dim2=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_wide_cat),2],
+                         expression=(tr_wide_cat[ix,]))
+plot_df$expression[plot_df$expression>quantile(plot_df$expression,0.99)] = quantile(plot_df$expression,0.99)
+plot_df$expression[plot_df$expression<quantile(plot_df$expression,0.01)] = quantile(plot_df$expression,0.01)
+plot_df$expression = scale(plot_df$expression)
+glist[[ix]] =   ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=0.8)+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint = median(plot_df$expression))+
+      theme_bw()+
+      labs(col="relative proportions",title=rownames(tr_wide_cat)[ix])+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+}
+
+ggarrange(plotlist = glist,common.legend = T,legend = "right")
+ggsave("figs/umap_scmix2_tr_cat_summary.pdf",width = 5.5,height = 5)
+```
+

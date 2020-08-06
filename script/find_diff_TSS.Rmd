@@ -1,0 +1,257 @@
+---
+title: "find different TSS"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(rtracklayer)
+library(ggplot2)
+```
+
+```{r}
+get_tss = function(isoform_gff){
+  isoform_tr = isoform_gff[isoform_gff$type=="transcript",]
+  isoform_tr = as.data.frame(isoform_tr)
+  isoform_tr$TSS = isoform_tr$start
+  isoform_tr$TSS[isoform_tr$strand=="-"] = isoform_tr$end[isoform_tr$strand=="-"]
+  isoform_tr = isoform_tr[,c("transcript_id","TSS")]
+  return(isoform_tr)
+}
+isoform_gencode = import("data/index/gencode.v33.annotation.gff3.gz")
+tss_encode = get_tss(isoform_gencode)
+```
+
+
+
+```{r}
+#fsm_splice_comp <- read.csv("data/PromethION_scmixology1/FLTSA_output/fsm_splice_comp.csv", header=FALSE, stringsAsFactors=FALSE)
+get_diff_TSS = function(data_dir){
+  isoform_gff = import(file.path(data_dir,"FLTSA_output","isoform_annotated.filtered.gff3"))
+  tss_df = get_tss(isoform_gff)
+  
+  tss_df = rbind(tss_df, tss_encode)
+  
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"FLTSA_output","isoform_FSM_annotation.csv"), stringsAsFactors=FALSE)
+  
+  
+  FSM_df = isoform_FSM_annotation %>% group_by(FSM_match) %>% summarise(tot_cnt=sum(total_count))
+  FSM_df_c = FSM_df %>% left_join(isoform_FSM_annotation,by=c("FSM_match"="FSM_match"))
+  FSM_df_c = FSM_df_c[!duplicated(FSM_df_c$FSM_match),]
+  
+  FSM_df_c = FSM_df_c %>% group_by(gene_id ) %>% top_n(n = 2, wt = tot_cnt) %>% mutate(cnt_ranks = order(order(tot_cnt, decreasing=TRUE))) %>% mutate(percent = tot_cnt/sum(tot_cnt))
+  FSM_df_c$gene_id=gsub("\\..*","", FSM_df_c$gene_id)
+  tss_df = tss_df[tss_df$transcript_id %in% FSM_df_c$transcript_id,]
+  tmp = FSM_df_c %>% left_join(tss_df,by=c("transcript_id"="transcript_id"))
+  tmp = tmp[!duplicated(tmp$FSM_match),]
+  tmp_ge = tmp %>% group_by(gene_id) %>% summarise(ge_sum = sum(tot_cnt))
+  tmp_ge = tmp_ge[tmp_ge$ge_sum>100,]
+  tmp = tmp[tmp$gene_id %in% tmp_ge$gene_id,]
+  tmp = tmp[tmp$percent>0.1,]
+  tmp = tmp[tmp$gene_id %in% names(table(tmp$gene_id)[table(tmp$gene_id)>1]),]
+  tmp_rk1 = tmp[tmp$cnt_ranks==1,]
+  tmp_rk1 = tmp_rk1[,c("gene_id","TSS")]
+  tmp_rk1 = tmp_rk1[!duplicated(tmp_rk1$gene_id),]
+  colnames(tmp_rk1) = c("gene_id","TSS_rk1")
+  tmp = tmp %>% left_join(tmp_rk1,by=c("gene_id"="gene_id"))
+  tmp$TSS_diff = abs(tmp$TSS_rk1-tmp$TSS)
+  tmp = tmp[tmp$TSS_diff>800,]
+  FSM_df_c = FSM_df_c[,!(colnames(FSM_df_c)=="total_count")]
+  tmp = tmp[,!(colnames(tmp)=="total_count")]
+  return(list(tmp,FSM_df_c))
+}
+
+
+```
+
+
+```{r}
+data_dir = "data/PromethION_scmixology1"
+scmix1_list = get_diff_TSS(data_dir)
+scmix1 = scmix1_list[[1]]
+
+data_dir = "data/PromethION_scmixology2"
+scmix2_list = get_diff_TSS(data_dir)
+scmix2 = scmix2_list[[1]]
+```
+
+
+
+```{r}
+comm_gene = intersect(scmix1$gene_id,scmix2$gene_id)
+scmix1_c = scmix1[match(comm_gene, scmix1$gene_id),]
+scmix2_c = scmix2[match(comm_gene, scmix2$gene_id),]
+
+major_TSS = (scmix1_c$TSS_rk1-scmix2_c$TSS_rk1)<100
+minor_TSS = (scmix1_c$TSS-scmix2_c$TSS)<100
+
+scmix1_c = scmix1_c[major_TSS & minor_TSS, ]
+scmix2_c = scmix2_c[major_TSS & minor_TSS, ]
+```
+
+```{r}
+chr_df = isoform_gencode
+chr_df = chr_df[chr_df$type=="gene",]
+chr_df = as.data.frame(chr_df)
+chr_df = chr_df[,c("seqnames","gene_id","gene_type","gene_name")]
+chr_df$gene_id = gsub("\\..*","", chr_df$gene_id)
+final_df =scmix1_c %>% left_join(chr_df,by=c("gene_id"="gene_id"))
+```
+
+```{r}
+write.csv(final_df,file="data/processed_files/TSS_diff_list.csv",row.names = FALSE)
+
+scmix2_df =scmix2 %>% left_join(chr_df,by=c("gene_id"="gene_id"))
+scmix2_df = scmix2_df[!duplicated(scmix2_df$gene_id),]
+
+write.csv(scmix2_df,file="data/processed_files/scmixology2_TSS_diff_list.csv",row.names = FALSE)
+
+scmix1_df =scmix1 %>% left_join(chr_df,by=c("gene_id"="gene_id"))
+scmix1_df = scmix1_df[!duplicated(scmix1_df$gene_id),]
+
+write.csv(scmix1_df,file="data/processed_files/scmixology1_TSS_diff_list.csv",row.names = FALSE)
+```
+
+
+```{r}
+atac_reg_cov <- read.csv("data/PromethION_scmixology2/FLTSA_output/atac_reg_cov.csv", stringsAsFactors=FALSE)
+active_df = atac_reg_cov[,1:2]
+active_df$log2_cnt = log2(rowSums(atac_reg_cov[,-c(1,2)])+1)
+active_df$active = TRUE
+active_df$active[active_df$log2_cnt<6] = FALSE
+tss1_only = c()
+both = c()
+tss2_only = c()
+for(ge in unique(atac_reg_cov$gene_id)){
+  tmp = atac_reg_cov[atac_reg_cov$gene_id==ge,]
+  tss1_only = c(tss1_only, sum(tmp[1,-(1:2)]>0 & tmp[2,-(1:2)]==0) )
+  both = c(both, sum(tmp[1,-(1:2)]>0 & tmp[2,-(1:2)]>0) )
+  tss2_only = c(tss2_only, sum(tmp[1,-(1:2)]==0 & tmp[2,-(1:2)]>0) )
+}
+TSS_cov_df = data.frame(gene_id=unique(atac_reg_cov$gene_id),tss1_only=tss1_only,both=both,
+                        tss2_only=tss2_only,stringsAsFactors = FALSE)
+
+
+```
+
+```{r}
+  gene_vec = unique(atac_reg_cov$gene_id)
+  gene_cnt = c()
+  atac_cnt = c()
+  major_expr_prop = c()
+  mean_prop = c()
+  bin_prop = c()
+  gene_sel = c()
+  bn_logll = c()
+  #ran_bn_logll = c()
+  for (ge in gene_vec) {
+    tmp_cnt = atac_reg_cov[atac_reg_cov$gene_id==ge,-c(1,2)]
+    tmp_cnt = as.matrix(tmp_cnt>0)*1
+    #tmp_cnt = as.matrix(tmp_cnt)
+    if(sum(tmp_cnt)>10 & !is.null(dim(tmp_cnt)) ){
+      if(!all(active_df[active_df$gene_id==ge,"active"])){
+        next
+      }
+      gene_sel = c(gene_sel, ge)
+      atac_cnt = c(atac_cnt,sum(tmp_cnt))
+      gene_cnt = c(gene_cnt, sum(scmix2_df[scmix2_df$gene_id==ge,"tot_cnt"]))
+      tmp_cnt = tmp_cnt[order(rowSums(tmp_cnt),decreasing = T),]
+      tmp_cnt = tmp_cnt[,colSums(tmp_cnt)>0]
+      major_expr_prop = c(major_expr_prop, sum(tmp_cnt[1,])/sum(tmp_cnt))
+      #ran_cnt = rbinom(ncol(tmp_cnt),colSums(tmp_cnt),major_expr_prop)
+      #ran_pb = dbinom(ran_cnt, colSums(tmp_cnt), major_expr_prop, log = T)
+      pb = dbinom(0, colSums(tmp_cnt), major_expr_prop)+dbinom(colSums(tmp_cnt), colSums(tmp_cnt), major_expr_prop)
+      bn_logll = c(bn_logll,mean(pb))
+      #ran_bn_logll = c(ran_bn_logll, sum(ran_pb))
+      major_prop = tmp_cnt[1,]/colSums(tmp_cnt)
+      mean_prop = c(mean_prop, mean(major_prop))
+      bi = sum(major_prop==1 | major_prop==0)
+      bin_prop = c(bin_prop, bi/ncol(tmp_cnt))
+    }
+  }
+    result_df = data.frame(gene_id=gene_sel,
+                         atac_cnt=log2(atac_cnt),
+                         gene_cnt=log2(gene_cnt),
+                         major_isoform_prop=major_expr_prop,
+                         mean_alt_prop=mean_prop,
+                         prop_binary=bin_prop,
+                         bn_logll=bn_logll,
+                         #ran_bn_logll=ran_bn_logll,
+                         stringsAsFactors = FALSE)
+```
+
+```{r}
+blk_thm =         theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"))
+ggplot(data=result_df)+
+  geom_point(aes(x=atac_cnt,y=prop_binary,col=gene_cnt),size=0.2,alpha=0.5)+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  geom_smooth(aes(x=atac_cnt,y=bn_logll),colour="black")+
+  theme_bw()+blk_thm
+
+ggplot(data=result_df)+
+  geom_point(aes(x=gene_cnt,y=bn_logll,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  geom_smooth(aes(x=atac_cnt,y=bn_logll),colour="black")+
+  theme_bw()+blk_thm
+
+ggplot(data=result_df)+
+  geom_point(aes(x=gene_cnt,y=major_isoform_prop,col=prop_binary),size=0.2,alpha=0.5)+
+  #labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  theme_bw()+blk_thm
+```
+
+
+```{r}
+sm1 = rowSums(TSS_cov_df[,c(2,3,4)])
+sm = 778
+ts1_prob = (TSS_cov_df$tss1_only+TSS_cov_df$both)/sm
+ts2_prob = (TSS_cov_df$tss2_only+TSS_cov_df$both)/sm
+both_prob = TSS_cov_df$both/sm
+joint_prob = ts1_prob*ts2_prob
+ggplot(data=NULL,aes(x=both_prob,y=joint_prob,col=sm1))+
+  geom_point()
+```
+```{r}
+ggplot(data=NULL,aes(x=ts1_prob, y=ts2_prob,col=sm1))+
+         geom_point()
+```
+
+
+
+```{r}
+plot_df = data.frame(atac_cov=c(sum(tss1_prob>0.01),length(tss1_prob)-sum(tss1_prob>0.01),sum(tss2_prob>0.01),length(tss2_prob)-sum(tss2_prob>0.01)), cond=c("cov","not_cov","cov","not_cov"),tss=c("primary TSS","primary TSS","secondary TSS","secondary TSS"))
+plot_df$cond = factor(plot_df$cond ,levels=c("not_cov","cov"))
+ggplot(data=plot_df,aes(x=tss,y=atac_cov,fill=cond))+
+  geom_bar(alpha=0.8,stat = "identity")+
+  scale_fill_brewer(palette = "Dark2")+
+  theme_bw()+
+    theme(legend.position="right",axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/ATAC_diff_tss_cov.pdf",width = 3,height = 4)
+```
+
+```{r}
+TFBS_scmix1 <- read.delim("~/Downloads/shared_and nonshared_TFBS_scmix1.tab")
+sm1 = rowSums(TFBS_scmix1[,c(2,3,4)])
+ts1_prob = (TFBS_scmix1$num_TFBS_1+TFBS_scmix1$num_TFBS_shared)/sm1
+ts2_prob = (TFBS_scmix1$num_TFBS_2+TFBS_scmix1$num_TFBS_shared)/sm1
+both_prob = TFBS_scmix1$num_TFBS_shared/sm1
+joint_prob = ts1_prob*ts2_prob
+ggplot(data=NULL,aes(x=both_prob,y=joint_prob,col=sm1))+
+  geom_point()
+```
+
+```{r}
+ggplot(data=NULL,aes(x=TFBS_scmix1$num_TFBS_1+TFBS_scmix1$num_TFBS_shared, 
+                     y=TFBS_scmix1$num_TFBS_2+TFBS_scmix1$num_TFBS_shared))+
+         geom_hex()
+ggplot(data=NULL,aes(x=as.numeric(apply(TFBS_scmix1,1,function(x){max(x[3:4])})), 
+                     y=TFBS_scmix1$num_TFBS_shared))+
+         geom_hex()
+```
+

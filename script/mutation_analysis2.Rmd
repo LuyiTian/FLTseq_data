@@ -1,0 +1,229 @@
+---
+title: "single cell long read mutation analysis on CLL2"
+output: html_notebook
+---
+
+
+```{r}
+library(ggplot2)
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+library(ggpubr)
+library(RColorBrewer)
+```
+
+```{r}
+get_var_table = function(data_dir){
+  ALT_cnt <- read.csv(file.path(data_dir,"mutation","alt_cnt.csv.gz"), stringsAsFactors=FALSE)
+  REF_cnt <- read.csv(file.path(data_dir,"mutation","ref_cnt.csv.gz"), stringsAsFactors=FALSE)
+  rownames(ALT_cnt) = paste(ALT_cnt$chr,ALT_cnt$position,sep="_")
+  rownames(REF_cnt) = paste(REF_cnt$chr,REF_cnt$position,sep="_")
+  comm_ra = intersect(rownames(ALT_cnt), rownames(REF_cnt))
+  ALT_cnt = ALT_cnt[comm_ra,-(1:2)]
+  REF_cnt = REF_cnt[comm_ra,-(1:2)]
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  cluster_barcode_anno = cluster_barcode_anno[cluster_barcode_anno$barcode_seq %in% colnames(REF_cnt),]
+  cluster_barcode_anno$groups = as.factor(cluster_barcode_anno$groups)
+  ALT_cnt = ALT_cnt[,cluster_barcode_anno$barcode_seq]
+  REF_cnt = REF_cnt[,cluster_barcode_anno$barcode_seq]
+  
+  outl =colSums(REF_cnt) < quantile(colSums(REF_cnt),0.99) & colSums(REF_cnt) > 50
+  cluster_barcode_anno = cluster_barcode_anno[outl,]
+  ALT_cnt=ALT_cnt[,outl]
+  REF_cnt=REF_cnt[,outl]
+  
+  ALT_cnt = (ALT_cnt>0) *1
+  REF_cnt = (REF_cnt>0) *1
+  
+  row_sel = rowSums(ALT_cnt)>20
+  ALT_cnt = ALT_cnt[row_sel,]
+  REF_cnt = REF_cnt[row_sel,]
+  
+  cnt_all = ALT_cnt+REF_cnt
+  cnt_all = (cnt_all>0) *1
+  
+  ALT_cnt = as.data.frame(ALT_cnt)
+  ALT_cnt$ch_pos = rownames(ALT_cnt)
+  data_long <- gather(ALT_cnt, cell_id, cnt,colnames(ALT_cnt)[!(colnames(ALT_cnt)=="ch_pos")])
+  data_long = left_join(data_long, cluster_barcode_anno[,c("barcode_seq","groups","cell_type")],by=c("cell_id"="barcode_seq"))
+  data_long = data_long[data_long$cell_type=="CLL",]
+  data_long = data_long %>% group_by(ch_pos, groups) %>% summarise(cnt=sum(cnt))
+  data_wide <- data_long %>% pivot_wider(id_cols=ch_pos, names_from=groups,values_from=cnt)
+  
+  cnt_all = as.data.frame(cnt_all)
+  cnt_all$ch_pos = rownames(cnt_all)
+  data_long_a <- gather(cnt_all, cell_id, cnt,colnames(cnt_all)[!(colnames(cnt_all)=="ch_pos")])
+  data_long_a = left_join(data_long_a, cluster_barcode_anno[,c("barcode_seq","groups","cell_type")],by=c("cell_id"="barcode_seq"))
+  data_long_a = data_long_a[data_long_a$cell_type=="CLL",]
+  data_long_a = data_long_a %>% group_by(ch_pos, groups) %>% summarise(cnt=sum(cnt))
+  data_wide_a <- data_long_a %>% pivot_wider(id_cols=ch_pos, names_from=groups,values_from=cnt)
+  
+  p_val_vec = rep(1,nrow(data_wide_a))
+  for (i in 1:nrow(data_wide_a)) {
+    a = rbind(data_wide_a[i,-1]-data_wide[i,-1],data_wide[i,-1])
+    a = a[apply(a,1,max)>15,apply(a,2,max)>15]
+          if (!is.null(dim(a))){
+            if(ncol(a)>1 & nrow(a)>1){
+                if(sum(a)>50){
+                  p_val_vec[i] = chisq.test(a)$p.value
+                }
+            }}
+  
+  }
+  
+  data_long <- gather(ALT_cnt, cell_id, cnt,colnames(ALT_cnt)[!(colnames(ALT_cnt)=="ch_pos")])
+  data_long = left_join(data_long, cluster_barcode_anno[,c("barcode_seq","groups","cell_type")],by=c("cell_id"="barcode_seq"))
+  data_long = data_long %>% group_by(ch_pos, cell_type) %>% summarise(cnt=sum(cnt))
+  data_wide_cll <- data_long %>% pivot_wider(id_cols=ch_pos, names_from=cell_type,values_from=cnt)
+  
+  result = list()
+  result[["ALT_df"]] = data_wide
+  result[["ALL_df"]] = data_wide_a
+  result[["CLL_df"]] = data_wide_cll
+  result[["p_val"]] = p_val_vec
+  return(result)
+}
+
+
+```
+
+```{r}
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/PromethION_CLL141"
+res141 = get_var_table(data_dir)
+
+```
+
+```{r}
+res141$CLL_df[res141$p_val<0.05/(nrow(res141$ALT_df)) & res141$CLL_df$non_cancer<5,]
+res141$p_val[res141$p_val<0.05/(nrow(res141$ALT_df)) & res141$CLL_df$non_cancer<5]
+```
+
+
+```{r}
+res141$ALL_df[res141$ALL_df$ch_pos=="chrX_22114485",]
+res141$ALT_df[res141$ALT_df$ch_pos=="chrX_22114485",]
+```
+
+
+```{r}
+library(qqman)
+merge_sel = data.frame(chr=sapply( strsplit(res141$ALT_df$ch_pos,"_"),function(x){x[1]} ),
+                       pos=as.numeric(sapply( strsplit(res141$ALT_df$ch_pos,"_"),function(x){x[2]} )),
+                       p_val=res141$p_val)
+merge_sel = merge_sel[res141$CLL_df$non_cancer<5,]
+merge_sel$chr_pos = paste(merge_sel$chr,merge_sel$pos,sep=":")
+merge_sel$chr_num =substring(merge_sel$chr,4)
+merge_sel$chr_num[merge_sel$chr_num=="X"] = 23
+merge_sel$chr_num[merge_sel$chr_num=="Y"] = 24
+merge_sel$chr_num = as.numeric(merge_sel$chr_num)
+sig_pval = 0.05/(nrow(res141$ALT_df))
+pdf("figs/manhattan_plot_CLL2.pdf",width = 5.5,height = 4)
+manhattan(merge_sel, chr="chr_num", bp="pos", snp="chr_pos", p="p_val",
+          suggestiveline=FALSE,
+          genomewideline=-log10(sig_pval),
+          annotatePval=sig_pval)
+dev.off()
+manhattan(merge_sel, chr="chr_num", bp="pos", snp="chr_pos", p="p_val",
+          suggestiveline=FALSE,
+          genomewideline=-log10(sig_pval),
+          annotatePval=sig_pval)
+```
+
+```{r,fig.width=3,fig.height=6}
+pos_list = res141$ALT_df$ch_pos[res141$p_val<0.05/(nrow(res141$ALT_df)) & res141$CLL_df$non_cancer<5]
+pp_list = list()
+for(ix in pos_list){
+  idx = which(res141$ALT_df$ch_pos== ix)
+  tmp = rbind(res141$ALT_df[idx,-1],res141$ALL_df[idx,-1]-res141$ALT_df[idx,-1])
+  tmp$allele_type = c("with_mutation","without_mutation")
+  data_long <- gather(tmp, cluster, cnt,colnames(tmp)[!(colnames(tmp)=="allele_type")])
+  data_long$cluster = as.factor(data_long$cluster)
+  data_long$cluster = factor(data_long$cluster,levels = 0:10)
+  pp_list[[ix]] =  ggplot(data=data_long,aes(x=cluster,y=cnt,fill=allele_type))+
+    geom_bar(stat = "identity")+
+    labs(x="cluster number",y="number of cells",fill="",title=ix)+
+    theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+  panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"))
+}
+ggpubr::ggarrange(plotlist = pp_list,ncol=1,nrow=4,common.legend = T,align ="h")
+ggsave("figs/CLL2_SNV_diffallele.pdf",width = 3,height = 6)
+```
+
+
+```{r,fig.width=4,fig.height=3}
+pos_list = res141$ALT_df$ch_pos[res141$p_val<0.05/(nrow(res141$ALT_df)) & res141$CLL_df$non_cancer<5]
+pos_list = c("chr18_63318364", "chr8_116846609", "chrX_22114485","chr11_62621873")
+pp_list = list()
+i=1
+for(ix in pos_list){
+  idx = which(res141$ALT_df$ch_pos== ix)
+  tmp = rbind(res141$ALT_df[idx,-1],res141$ALL_df[idx,-1]-res141$ALT_df[idx,-1])
+  tmp$allele_type = c("with_mutation","without_mutation")
+  data_long <- gather(tmp, cluster, cnt,colnames(tmp)[!(colnames(tmp)=="allele_type")])
+  data_long = data_long[data_long$cluster %in% c(0,1,2,3,4),]
+  data_long$pop = "clone2"
+  data_long$pop[data_long$cluster %in% c(1,2)] = "clone1"
+  data_long1 = data_long[data_long$pop=="clone1",]
+  data_long1 = data_long1 %>% group_by(allele_type) %>% summarise(cnt_sum=sum(cnt))
+  data_long1$fraction <- data_long1$cnt_sum / sum(data_long1$cnt_sum)
+  data_long1$ymax <- cumsum(data_long1$fraction)
+  data_long1$ymin <- c(0, head(data_long1$ymax, n=-1))
+  #data_long$cluster = as.factor(data_long$cluster)
+  #data_long$cluster = factor(data_long$cluster,levels = 0:10)
+  pp_list[[i]] =  ggplot(data_long1, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=2.5, fill=allele_type)) +
+  geom_rect() +
+  #scale_fill_brewer(palette=3) +
+  scale_fill_manual(values=c("#ED4E31","#8FAADC"))+
+  coord_polar(theta="y") +
+  xlim(c(1.5, 4)) +
+  theme_void() +
+  theme(legend.position = "none")
+  ###
+  data_long2 = data_long[data_long$pop=="clone2",]
+  data_long2 = data_long2 %>% group_by(allele_type) %>% summarise(cnt_sum=sum(cnt))
+  data_long2$fraction <- data_long2$cnt_sum / sum(data_long2$cnt_sum)
+  data_long2$ymax <- cumsum(data_long2$fraction)
+  data_long2$ymin <- c(0, head(data_long2$ymax, n=-1))
+  #data_long$cluster = as.factor(data_long$cluster)
+  #data_long$cluster = factor(data_long$cluster,levels = 0:10)
+  pp_list[[i+4]] =  ggplot(data_long2, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=2.5, fill=allele_type)) +
+  geom_rect() +
+  #scale_fill_brewer(palette=3) +
+  scale_fill_manual(values=c("#ED4E31","#8FAADC"))+
+  coord_polar(theta="y") +
+  xlim(c(1.5, 4)) +
+  theme_void() +
+  theme(legend.position = "none")
+  i = i+1
+}
+ggpubr::ggarrange(plotlist = pp_list,ncol=4,nrow=2)
+ggsave("figs/CLL2_SNV_2cluster_donut.pdf")
+```
+
+
+```{r}
+CLL141_lib20_srt <- readRDS("~/Dropbox/research/sc_longread/Rachel/short_reads/CLL141_lib20_srt.Rds")
+CLL141_lib20_srt$cell_type = "others"
+CLL141_lib20_srt$cell_type[CLL141_lib20_srt$seurat_clusters %in% c(1,2)] = "population1"
+CLL141_lib20_srt$cell_type[CLL141_lib20_srt$seurat_clusters %in% c(0,3,4)] = "population2"
+DimPlot(CLL141_lib20_srt,group.by = "cell_type")
+```
+```{r}
+ggplot()+
+      geom_point(aes(x=CLL141_lib20_srt@reductions$umap@cell.embeddings[,1],y=CLL141_lib20_srt@reductions$umap@cell.embeddings[,2],col=CLL141_lib20_srt$cell_type),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="")+
+      scale_color_manual(values = c("#AAAAAA","#277558","#DF6125"))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/umap_CLL2_2cluster.pdf",width = 3,height = 3)
+```
+

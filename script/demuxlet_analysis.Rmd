@@ -1,0 +1,353 @@
+---
+title: "demultiplex individuals from long read sequencing data"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+library(ggpubr)
+library(RColorBrewer)
+library(mclust)
+library(ggrepel)
+```
+
+```{r}
+get_var_celline_table = function(data_dir,cluster_barcode_anno){
+  ALT_cnt <- read.csv(file.path(data_dir,"mutation","alt_cnt.csv.gz"), stringsAsFactors=FALSE)
+  REF_cnt <- read.csv(file.path(data_dir,"mutation","ref_cnt.csv.gz"), stringsAsFactors=FALSE)
+  rownames(ALT_cnt) = paste(ALT_cnt$chr,ALT_cnt$position,sep="_")
+  rownames(REF_cnt) = paste(REF_cnt$chr,REF_cnt$position,sep="_")
+  comm_ra = intersect(rownames(ALT_cnt), rownames(REF_cnt))
+  ALT_cnt = ALT_cnt[comm_ra,-(1:2)]
+  REF_cnt = REF_cnt[comm_ra,-(1:2)]
+  
+  #cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  #cluster_barcode_anno = cluster_barcode_anno[cluster_barcode_anno$barcode_seq %in% colnames(REF_cnt),]
+  cluster_barcode_anno = cluster_barcode_anno[cluster_barcode_anno$barcode_seq %in% colnames(ALT_cnt),]
+  cluster_barcode_anno$groups = as.factor(cluster_barcode_anno$groups)
+  ALT_cnt = ALT_cnt[,cluster_barcode_anno$barcode_seq]
+  REF_cnt = REF_cnt[,cluster_barcode_anno$barcode_seq]
+  
+  outl =colSums(REF_cnt) < quantile(colSums(REF_cnt),0.99) & colSums(REF_cnt) > 50
+  cluster_barcode_anno = cluster_barcode_anno[outl,]
+  ALT_cnt=ALT_cnt[,outl]
+  REF_cnt=REF_cnt[,outl]
+  
+  ALT_cnt = (ALT_cnt>0) *1
+  REF_cnt = (REF_cnt>0) *1
+  
+  row_sel = rowSums(ALT_cnt)>20
+  ALT_cnt = ALT_cnt[row_sel,]
+  REF_cnt = REF_cnt[row_sel,]
+  
+  cnt_all = ALT_cnt+REF_cnt
+  cnt_all = (cnt_all>0) *1
+  
+  ALT_cnt = as.data.frame(ALT_cnt)
+  ALT_cnt$ch_pos = rownames(ALT_cnt)
+  data_long <- gather(ALT_cnt, cell_id, cnt,colnames(ALT_cnt)[!(colnames(ALT_cnt)=="ch_pos")])
+  data_long = left_join(data_long, cluster_barcode_anno[,c("barcode_seq","groups")],by=c("cell_id"="barcode_seq"))
+  data_long = data_long[!is.na(data_long$groups),]
+  #data_long = data_long[data_long$cell_type=="CLL",]
+  data_long = data_long %>% group_by(ch_pos, groups) %>% summarise(cnt=sum(cnt))
+  data_wide <- data_long %>% pivot_wider(id_cols=ch_pos, names_from=groups,values_from=cnt)
+  
+  cnt_all = as.data.frame(cnt_all)
+  cnt_all$ch_pos = rownames(cnt_all)
+  data_long_a <- gather(cnt_all, cell_id, cnt,colnames(cnt_all)[!(colnames(cnt_all)=="ch_pos")])
+  data_long_a = left_join(data_long_a, cluster_barcode_anno[,c("barcode_seq","groups")],by=c("cell_id"="barcode_seq"))
+  #data_long_a = data_long_a[data_long_a$cell_type=="CLL",]
+  data_long_a = data_long_a[!is.na(data_long_a$groups),]
+  data_long_a = data_long_a %>% group_by(ch_pos, groups) %>% summarise(cnt=sum(cnt))
+  data_wide_a <- data_long_a %>% pivot_wider(id_cols=ch_pos, names_from=groups,values_from=cnt)
+  
+  p_val_vec = rep(1,nrow(data_wide_a))
+  for (i in 1:nrow(data_wide_a)) {
+    a = rbind(data_wide_a[i,-1]-data_wide[i,-1],data_wide[i,-1])
+    a = a[apply(a,1,max)>15,apply(a,2,max)>15]
+          if (!is.null(dim(a))){
+            if(ncol(a)>1 & nrow(a)>1){
+                if(sum(a)>50){
+                  p_val_vec[i] = chisq.test(a)$p.value
+                }
+            }}
+  
+  }
+  
+  result = list()
+  result[["ALT_df"]] = data_wide
+  result[["ALL_df"]] = data_wide_a
+  #result[["CLL_df"]] = data_wide_cll
+  result[["p_val"]] = p_val_vec
+  return(result)
+}
+```
+
+
+```{r}
+joint_calls_5 <- read.table("joint_calls_5.vcf", quote="\"", stringsAsFactors=FALSE)
+joint_calls_5$ch_pos = paste(joint_calls_5$V1,joint_calls_5$V2-1,sep="_")
+joint_calls_5$ch_pos = paste0("chr",joint_calls_5$ch_pos)
+```
+
+```{r}
+file_list = list("scmixology1"="data/PromethION_scmixology1/mutation/freq_summary.csv",
+                 "scmixology2"="data/PromethION_scmixology2/mutation/freq_summary.csv",
+                 "MuSC"="data/PromethION_MuSC/mutation/freq_summary.csv",
+                 "CLL2"="data/PromethION_CLL2/mutation/freq_summary.csv")
+
+get_freq_table = function(x){
+  freq_summary <- read.csv(file_list[[x]], header=FALSE)
+freq_summary$cum_prop = cumsum(freq_summary$V2)/sum(freq_summary$V2)
+colnames(freq_summary) = c("REF_proportions","frequency","cum_freq_proportions")
+freq_summary$batch = x
+freq_summary
+}
+
+ref_freq_df = Reduce(rbind, lapply(c("scmixology1","scmixology2","MuSC","CLL2"),get_freq_table))
+```
+
+```{r}
+ref_freq_df$label_prop = ref_freq_df$cum_freq_proportions
+ref_freq_df$label_prop  = format(round(ref_freq_df$label_prop , 3), nsmall = 3)
+ref_freq_df$label_prop[ref_freq_df$REF_proportions!=0.9] = ""
+ggplot(data=ref_freq_df,aes(x=REF_proportions,y=cum_freq_proportions,col=batch,label=label_prop))+
+  geom_line()+
+  ggrepel::geom_text_repel()+
+  theme_bw()
+ggsave("figs/reference_allele_frequency.pdf",width = 4,height = 2)
+```
+
+
+# scmixology1
+
+```{r}
+alt_cnt <- read.csv("data/PromethION_scmixology1/mutation/alt_cnt.csv.gz", stringsAsFactors=FALSE)
+allele_stat <- read.csv("data/PromethION_scmixology1/mutation/allele_stat.csv.gz", stringsAsFactors=FALSE)
+
+rownames(alt_cnt) = paste(alt_cnt$chr,alt_cnt$position,sep="_")
+allele_stat$pos_id = paste(allele_stat$chr,allele_stat$position,sep="_")
+allele_stat = allele_stat[!duplicated(allele_stat$pos_id),]
+```
+
+```{r}
+pos_kept = allele_stat$pos_id[!(allele_stat$ALT=="A" & allele_stat$REF=="G") & allele_stat$REF_frequency>0.2 & allele_stat$REF_frequency<0.8 & allele_stat$hypergeom_test_p_value<1e-5 & allele_stat$INDEL_frequency<0.1 & allele_stat$sequence_entrophy>1.2]
+```
+
+```{r}
+#alt_cnt_sel = alt_cnt[pos_kept,]
+alt_cnt_sel = alt_cnt
+alt_cnt_sel = alt_cnt_sel[,-(1:2)]
+alt_cnt_sel = as.matrix(alt_cnt_sel>0)*1
+alt_cnt_sel = alt_cnt_sel[,colSums(alt_cnt_sel)>quantile(colSums(alt_cnt_sel),0.01) & colSums(alt_cnt_sel)<max(colSums(alt_cnt_sel))]
+#alt_cnt_sel = alt_cnt_sel[rowSums(alt_cnt_sel)> (0.2*ncol(alt_cnt_sel)) & rowSums(alt_cnt_sel)< (0.8*ncol(alt_cnt_sel)),]
+size_f = colSums(alt_cnt_sel)
+alt_cnt_sel = t(t(alt_cnt_sel)/(size_f/median(size_f)))
+```
+
+```{r}
+pca_out = prcomp(t(alt_cnt_sel))
+ggplot(data=NULL,aes(x=pca_out$x[,1],y=pca_out$x[,2],col=size_f))+geom_point()
+```
+
+
+
+
+
+
+```{r}
+snn_g = scran::buildSNNGraph(alt_cnt_sel,k=20,d=5)
+clust.output <- igraph::cluster_louvain(snn_g)
+clust.louvain = clust.output$membership
+table(clust.louvain)
+```
+
+```{r}
+tp = data.frame(barcode_seq=colnames(alt_cnt_sel),
+                pca1=pca_out$x[,1],
+                pca2=pca_out$x[,2],
+                pca3=pca_out$x[,3],
+                pca4=pca_out$x[,4],
+                groups=as.factor(clust.louvain))
+
+sc_10X_5cl <- read.delim("~/git/CellBench_data/misc/demuxlet_output/sc_10X_5cl.best", stringsAsFactors=FALSE)
+sc_10X_5cl = sc_10X_5cl %>% left_join(tp,by=c("BARCODE"="barcode_seq"))
+sc_10X_5cl = sc_10X_5cl[!is.na(sc_10X_5cl$groups),]
+
+table(sc_10X_5cl$BEST,sc_10X_5cl$groups)
+```
+
+
+
+```{r}
+adjustedRandIndex(sc_10X_5cl$BEST, sc_10X_5cl$groups)
+```
+
+
+```{r}
+sc_10X_5cl$cl = sc_10X_5cl$BEST
+sc_10X_5cl$cl = sapply(strsplit(sc_10X_5cl$cl,"-"),function(x){x[2]})
+sc_10X_5cl$cl[grepl("DBL",sc_10X_5cl$cl)] = "DBL"
+sc_10X_5cl$cl[sc_10X_5cl$cl=="H8383"] = "H838"
+ggplot(data=sc_10X_5cl[sc_10X_5cl$cl!="DBL",],aes(x=pca1,y=pca2,col=cl))+
+  labs(x="PC1",y="PC2",col="cell_line")+
+  geom_point(size=0.8)+
+  theme_bw()+
+        theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/var_freq_pca_scmix1.pdf",width = 3.3,height = 2.5)
+```
+
+
+
+```{r}
+
+sc_10X_5cl_sng = sc_10X_5cl[grepl("SNG",sc_10X_5cl$BEST),]
+get_cluster_label = function(i){
+  tmp = as.data.frame(table(sc_10X_5cl_sng$BEST[sc_10X_5cl_sng$groups==i]))
+  tmp = tmp[order(tmp$Freq,decreasing = T),]
+  return(tmp$Var1[1])
+}
+levels( sc_10X_5cl_sng$groups )=  sapply(levels(sc_10X_5cl_sng$groups),get_cluster_label)
+sc_10X_5cl_sng$BEST = as.factor(sc_10X_5cl_sng$BEST)
+acc = caret::confusionMatrix( sc_10X_5cl_sng$groups, sc_10X_5cl_sng$BEST)
+acc$overall[1]
+```
+
+```{r,warning=FALSE,message=FALSE}
+scmix1_var_list = get_var_celline_table("data/PromethION_scmixology1",tp)
+set.seed(66666)
+tp_ran = tp
+tp_ran$groups = tp_ran$groups[sample(nrow(tp_ran))]
+scmix1_ran_list = get_var_celline_table("data/PromethION_scmixology1",tp_ran)
+
+table(scmix1_var_list$ALT_df$ch_pos[scmix1_var_list$p_val<(0.01/length(scmix1_var_list$p_val))] %in% joint_calls_5$ch_pos)
+3332/(826 + 3332)
+```
+
+
+```{r}
+idx = 18029
+rbind(scmix1_var_list$ALT_df[9190,-1],scmix1_var_list$ALL_df[9190,-1]-scmix1_var_list$ALT_df[9190,-1])
+```
+
+
+#scmixology2
+
+```{r}
+sc_10X_5cl <- read.delim("data/PromethION_scmixology2/sc_10x_cr_v3.best", stringsAsFactors=FALSE)
+sc_10X_5cl$BARCODE = sapply(strsplit(sc_10X_5cl$BARCODE,"-"),function(x){x[1]})
+sc_10X_5cl = sc_10X_5cl[-1,]
+```
+
+
+```{r}
+alt_cnt <- read.csv("data/PromethION_scmixology2/mutation/alt_cnt.csv.gz", stringsAsFactors=FALSE)
+allele_stat <- read.csv("data/PromethION_scmixology2/mutation/allele_stat.csv.gz", stringsAsFactors=FALSE)
+
+rownames(alt_cnt) = paste(alt_cnt$chr,alt_cnt$position,sep="_")
+allele_stat$pos_id = paste(allele_stat$chr,allele_stat$position,sep="_")
+allele_stat = allele_stat[!duplicated(allele_stat$pos_id),]
+```
+
+```{r}
+pos_kept = allele_stat$pos_id[ !(allele_stat$ALT=="A" & allele_stat$REF=="G") & allele_stat$REF_frequency>0.2 & allele_stat$REF_frequency<0.8 & allele_stat$hypergeom_test_p_value<1e-5 & allele_stat$INDEL_frequency<0.1 & allele_stat$sequence_entrophy>1.1]
+```
+
+```{r}
+alt_cnt_sel = alt_cnt[pos_kept,]
+alt_cnt_sel = alt_cnt_sel[,-(1:2)]
+alt_cnt_sel = as.matrix(alt_cnt_sel>0)*1
+alt_cnt_sel = alt_cnt_sel[,colnames(alt_cnt_sel) %in% sc_10X_5cl$BARCODE]
+alt_cnt_sel = alt_cnt_sel[,colSums(alt_cnt_sel)>2000 & colSums(alt_cnt_sel)<max(colSums(alt_cnt_sel))]
+alt_cnt_sel = alt_cnt_sel[rowSums(alt_cnt_sel)> (0.2*ncol(alt_cnt_sel)) & rowSums(alt_cnt_sel)< (0.8*ncol(alt_cnt_sel)),]
+size_f = colSums(alt_cnt_sel)
+alt_cnt_sel = t(t(alt_cnt_sel)/(size_f/median(size_f)))
+```
+
+
+
+
+```{r}
+pca_out = prcomp(t(alt_cnt_sel))
+ggplot(data=NULL,aes(x=pca_out$x[,1],y=pca_out$x[,2],col=size_f))+geom_point()
+```
+
+
+
+
+```{r}
+snn_g = scran::buildSNNGraph(alt_cnt_sel,k=10,d=5)
+clust.output <- igraph::cluster_louvain(snn_g)
+clust.louvain = clust.output$membership
+table(clust.louvain)
+```
+
+```{r}
+tp = data.frame(barcode_seq=colnames(alt_cnt_sel),
+                pca1=pca_out$x[,1],
+                pca2=pca_out$x[,2],
+                pca3=pca_out$x[,3],
+                pca4=pca_out$x[,4],
+                groups=as.factor(clust.louvain))
+
+sc_10X_5cl = sc_10X_5cl %>% left_join(tp,by=c("BARCODE"="barcode_seq"))
+sc_10X_5cl = sc_10X_5cl[!is.na(sc_10X_5cl$cluster_ident),]
+
+table(sc_10X_5cl$BEST,sc_10X_5cl$cluster_ident)
+```
+```{r}
+sc_10X_5cl$cl = sc_10X_5cl$BEST
+sc_10X_5cl$cl = sapply(strsplit(sc_10X_5cl$cl,"-"),function(x){x[2]})
+sc_10X_5cl$cl[grepl("DBL",sc_10X_5cl$cl)] = "DBL"
+sc_10X_5cl$cl[sc_10X_5cl$cl=="H8383"] = "H838"
+ggplot(data=sc_10X_5cl[sc_10X_5cl$cl!="DBL",],aes(x=pca1,y=pca2,col=cl))+
+  labs(x="PC1",y="PC2",col="cell_line")+
+  geom_point(size=0.8)+
+  theme_bw()+
+        theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/var_freq_pca_scmix2.pdf",width = 3.3,height = 2.5)
+```
+
+
+```{r}
+adjustedRandIndex(sc_10X_5cl$BEST, sc_10X_5cl$cluster_ident)
+```
+
+
+```{r}
+sc_10X_5cl_sng = sc_10X_5cl[grepl("SNG",sc_10X_5cl$BEST),]
+get_cluster_label = function(i){
+  tmp = as.data.frame(table(sc_10X_5cl_sng$BEST[sc_10X_5cl_sng$cluster_ident==i]))
+  tmp = tmp[order(tmp$Freq,decreasing = T),]
+  return(tmp$Var1[1])
+}
+levels( sc_10X_5cl_sng$cluster_ident )=  sapply(levels(sc_10X_5cl_sng$cluster_ident),get_cluster_label)
+sc_10X_5cl_sng$BEST = as.factor(sc_10X_5cl_sng$BEST)
+acc = caret::confusionMatrix( sc_10X_5cl_sng$cluster_ident, sc_10X_5cl_sng$BEST)
+acc$overall[1]
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+scmix2_var_list = get_var_celline_table("data/PromethION_scmixology2",tp)
+
+
+table(scmix2_var_list$ALT_df$ch_pos[scmix2_var_list$p_val<(0.01/length(scmix2_var_list$p_val))] %in% joint_calls_5$ch_pos)
+#3332/(826 + 3332)
+```
+
+
+

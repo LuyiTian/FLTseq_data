@@ -1,0 +1,216 @@
+---
+title: "compare FLAMES other tools"
+output: html_notebook
+---
+
+
+
+```{r,warning=FALSE,message=FALSE}
+library(readxl)
+library(ggplot2)
+library(tidyverse)
+library(VennDiagram)
+library(ggpubr)
+library(RColorBrewer)
+library(ggsci)
+library(rtracklayer)
+```
+
+# Stringtie
+
+```{r}
+stringtie_gtf = import("data/bulk/stringtie/scmix1_stringtie.gtf")
+```
+
+```{r}
+string_cnt = stringtie_gtf[!is.na(stringtie_gtf$TPM),]
+string_cnt = string_cnt[!duplicated(string_cnt$transcript_id),]
+
+string_cnt = data.frame(transcript_id =string_cnt$transcript_id, reference_id=string_cnt$reference_id,TPM=as.numeric(string_cnt$TPM),stringsAsFactors = FALSE)
+```
+
+
+```{r}
+stringtie_tr = stringtie_gtf[stringtie_gtf$type=="transcript" & strand(stringtie_gtf)!="*",]
+
+TSS_df = data.frame(ch=seqnames(stringtie_tr), TSS = start(stringtie_tr), gene_id=stringtie_tr$gene_id,tr_id=stringtie_tr$transcript_id, strand =strand(stringtie_tr),TPM=stringtie_tr$TPM,stringsAsFactors = FALSE)
+TSS_df$gene_id[!is.na(stringtie_tr$ref_gene_id)] = stringtie_tr$ref_gene_id[!is.na(stringtie_tr$ref_gene_id)]
+TSS_df$tr_id[!is.na(stringtie_tr$reference_id)] = stringtie_tr$reference_id[!is.na(stringtie_tr$reference_id)]
+
+TSS_df$TSS[TSS_df$strand=="-"] = end(stringtie_tr)[TSS_df$strand=="-"]
+
+TSS_df$start = TSS_df$TSS-500
+TSS_df$start[TSS_df$strand=="-"] = TSS_df$TSS[TSS_df$strand=="-"]-200
+
+TSS_df$end = TSS_df$TSS+200
+TSS_df$end[TSS_df$strand=="-"] = TSS_df$TSS[TSS_df$strand=="-"]+500
+TSS_df$TPM = as.numeric(TSS_df$TPM)
+write.csv(TSS_df,file="stringtie_TSS_region_500_200.csv",row.names = FALSE)
+```
+
+
+```{r}
+scmix1_stringtie_clean_classification <- read.delim("data/bulk/stringtie/scmix1_stringtie_clean_classification.txt")
+table(scmix1_stringtie_clean_classification$structural_category)
+```
+
+```{r}
+scmix1_stringtie_sel = scmix1_stringtie_clean_classification[,c("isoform","structural_category","within_cage_peak")]
+scmix1_stringtie_sel$method = "StringTie2"
+```
+
+
+# FLAIR
+
+```{r}
+pattern = "#[[:alnum:]]{8}-[[:alnum:]]{4}-[[:alnum:]]{4}-[[:alnum:]]{4}-[[:alnum:]]{12}"  # have to fix inconsistent transcript id between different files
+convert_flair_id = function(x){
+  if(grepl("ENST",x)){
+    return(strsplit(x,"_")[[1]][1])
+  }else{
+    regmatches(x, regexpr(pattern, x)) 
+  }
+}
+```
+
+
+```{r}
+flair_gtf = import("data/bulk/FLAIR/promethion_2509.collapsed.isoforms.gtf")
+#flair_gtf = flair_gtf[grepl("ENSG",flair_gtf$gene_id),]
+
+flair_classification <- read.delim("~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/FLAIR/promethion_2509.collapsed.isoforms_classification.txt")
+
+flair_count <- read.delim("~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/FLAIR/promethion_2509_count.tsv")
+flair_count$ids = sapply(flair_count$ids,convert_flair_id )
+flair_count = flair_count[flair_count$combined_samples_conditionA_batch1>=10,]
+
+#flair_gtf$transcript_id = paste(flair_gtf$transcript_id,flair_gtf$gene_id,sep="_")
+flair_gtf$transcript_id = sapply(flair_gtf$transcript_id,convert_flair_id )
+comm_ids = intersect( flair_gtf$transcript_id,flair_count$ids)
+
+table(flair_gtf$transcript_id %in% flair_count$ids)
+table(flair_count$ids %in% flair_gtf$transcript_id)
+
+flair_gtf = flair_gtf[flair_gtf$transcript_id %in% comm_ids,]
+flair_count = flair_count[flair_count$ids %in% comm_ids,]
+```
+
+
+```{r}
+flair_gtf_df = as.data.frame(flair_gtf)
+flair_gtf_df = flair_gtf_df %>% group_by(transcript_id) %>% mutate(min_st=min(start)) %>% mutate(max_en=max(end))
+
+flair_gtf_df$TSS = flair_gtf_df$min_st
+flair_gtf_df$TSS[flair_gtf_df$strand=="-"] = flair_gtf_df$max_en[flair_gtf_df$strand=="-"]
+flair_gtf_df = flair_gtf_df[!duplicated(flair_gtf_df$transcript_id),]
+flair_gtf_df = flair_gtf_df %>% left_join(flair_count,by=c("transcript_id"="ids"))
+TSS_df = flair_gtf_df[,c("seqnames","strand","TSS","combined_samples_conditionA_batch1")]
+
+TSS_df$start = TSS_df$TSS-500
+TSS_df$start[TSS_df$strand=="-"] = TSS_df$TSS[TSS_df$strand=="-"]-200
+
+TSS_df$end = TSS_df$TSS+200
+TSS_df$end[TSS_df$strand=="-"] = TSS_df$TSS[TSS_df$strand=="-"]+500
+
+colnames(TSS_df) = c("ch","strand","TSS","count","start","end")
+write.csv(TSS_df,file="FLAIR_TSS_region_500_200_new.csv",row.names = FALSE)
+```
+
+```{r}
+scmix1_flair_classification <- read.delim("data/bulk/FLAIR/promethion_2509.collapsed.isoforms_classification.txt")
+scmix1_flair_classification$isoform = sapply(scmix1_flair_classification$isoform,convert_flair_id )
+scmix1_flair_classification = scmix1_flair_classification[scmix1_flair_classification$isoform %in% flair_count$ids,]
+scmix1_flair_sel = scmix1_flair_classification[,c("isoform","structural_category","within_cage_peak")]
+scmix1_flair_sel$method = "FLAIR"
+```
+
+
+# TALON
+
+```{r}
+#flair_gtf = import("data/bulk/TALON/filtered_talon.gtf")
+#flair_gtf$transcript_id = paste(seqnames(flair_gtf),flair_gtf$transcript_id,sep="_")
+#export(flair_gtf, "data/bulk/TALON/filtered_talon_fix.gtf")
+
+flair_gtf = import("data/bulk/TALON/filtered_talon_fix.gtf")
+tr_cnt_filtered <- read.csv("~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/TALON/tr_cnt_filtered.csv")
+
+flair_gtf = flair_gtf[flair_gtf$transcript_id %in% tr_cnt_filtered$transcript_id,]
+flair_gtf=flair_gtf[flair_gtf$type=="transcript",]
+```
+
+```{r}
+flair_gtf_df = as.data.frame(flair_gtf)
+flair_gtf_df = flair_gtf_df %>% group_by(transcript_id) %>% mutate(min_st=min(start)) %>% mutate(max_en=max(end))
+
+flair_gtf_df$TSS = flair_gtf_df$min_st
+flair_gtf_df$TSS[flair_gtf_df$strand=="-"] = flair_gtf_df$max_en[flair_gtf_df$strand=="-"]
+flair_gtf_df = flair_gtf_df[!duplicated(flair_gtf_df$transcript_id),]
+flair_gtf_df = flair_gtf_df %>% left_join(tr_cnt_filtered,by=c("transcript_id"="transcript_id"))
+TSS_df = flair_gtf_df[,c("seqnames","strand","TSS","cnt")]
+
+TSS_df$start = TSS_df$TSS-500
+TSS_df$start[TSS_df$strand=="-"] = TSS_df$TSS[TSS_df$strand=="-"]-200
+
+TSS_df$end = TSS_df$TSS+200
+TSS_df$end[TSS_df$strand=="-"] = TSS_df$TSS[TSS_df$strand=="-"]+500
+
+colnames(TSS_df) = c("ch","strand","TSS","count","start","end")
+write.csv(TSS_df,file="TALON_TSS_region_500_200.csv",row.names = FALSE)
+```
+
+```{r}
+scmix1_TALON_classification <- read.delim("data/bulk/TALON/filtered_talon_fix_classification.txt")
+
+scmix1_TALON_classification = scmix1_TALON_classification[scmix1_TALON_classification$isoform %in% flair_gtf$transcript_id,]
+scmix1_TALON_sel = scmix1_TALON_classification[,c("isoform","structural_category","within_cage_peak")]
+scmix1_TALON_sel$method = "TALON"
+```
+
+
+# FLAMES
+
+```{r}
+data_dir="data/PromethION_scmixology1/FLAMES_output/"
+transcript_assembly_classification <- read.delim(file.path(data_dir,"transcript_assembly_classification.txt.gz"))
+isoform_FSM_annotation <- read.csv(file.path(data_dir,"isoform_FSM_annotation.csv"))
+transcript_assembly_classification = transcript_assembly_classification[transcript_assembly_classification$isoform %in% isoform_FSM_annotation$transcript_id,]
+scmix1_FLAMES_sel = transcript_assembly_classification[,c("isoform","structural_category","within_cage_peak")]
+scmix1_FLAMES_sel$method = "FLAMES"
+```
+
+```{r}
+isoform_anno_combined = rbind(scmix1_FLAMES_sel, scmix1_TALON_sel,scmix1_flair_sel,scmix1_stringtie_sel)
+isoform_anno_combined$known_transcript = "novel"
+isoform_anno_combined$known_transcript[isoform_anno_combined$structural_category=="full-splice_match"] = "known"
+isoform_anno_combined$known_transcript = factor(isoform_anno_combined$known_transcript,levels = c("novel","known"))
+```
+
+```{r}
+ggplot(data=isoform_anno_combined,aes(x=method,fill=known_transcript))+
+  geom_bar(alpha=0.7)+
+  labs(y="number of transcripts")+
+  scale_fill_manual(values = c("cadetblue3","darkred"))+
+    theme(legend.position = "top",axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/comp_scmix1_knowntranscript.pdf",width = 3,height = 3.5)
+```
+
+```{r}
+ggplot(data=isoform_anno_combined,aes(x=method,fill=within_cage_peak))+
+  geom_bar(alpha=0.9)+
+  labs(y="number of transcripts")+
+  scale_fill_manual(values = c("turquoise3","orange2"))+
+    theme(legend.position = "top",axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/comp_scmix1_cagepeak.pdf",width = 3,height = 3.5)
+```
+
+
+
+
+

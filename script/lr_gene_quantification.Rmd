@@ -1,0 +1,388 @@
+---
+title: "long read gene level quantification"
+output: html_notebook
+---
+
+
+```{r,warning=FALSE,message=FALSE}
+library(scPipe)
+library(scater)
+library(scran)
+library(ggplot2)
+library(pheatmap)
+```
+
+
+```{r}
+filter_genes = function(sce){
+  keep1 = (apply(counts(sce), 1, function(x) mean(x[x>0])) > 1.1) 
+  keep2 = (rowSums(counts(sce)>0) > 3)  # expressed in more than 3 cells
+  sce[(keep1 & keep2), ]
+}
+
+cal_gene_corr = function(sce1,sce2){
+  sapply(1:ncol(sce1),function(i){cor(counts(sce1)[,i],counts(sce2)[,i])})
+}
+```
+
+
+
+# 5 cell line data
+
+## batch1 with 10x v2 chemistry
+
+### promethion
+
+```{r}
+sce_lr = create_sce_by_dir(datadir = "data/PromethION_scmixology1/scpipe_output",organism = "hsapiens_gene_ensembl",gene_id_type = "ensembl_gene_id")
+sce_lr = calculate_QC_metrics(sce_lr)
+sce_lr = sce_lr[,sce_lr$total_count_per_cell>10 & sce_lr$total_count_per_cell<150000]
+sce_lr = detect_outlier(sce_lr,comp = 2)
+sce_lr = remove_outliers(sce_lr)
+Lib_10 <- read.csv("data/PromethION_scmixology1/scpipe_output/Lib10.1000.csv", row.names=1, stringsAsFactors=FALSE)
+sce_lr = sce_lr[,colnames(sce_lr) %in% rownames(Lib_10)]
+sce_lr$barcode_seq = Lib_10[colnames(sce_lr),"barcode_sequence"]
+colnames(sce_lr) = sce_lr$barcode_seq 
+
+load("~/git/CellBench_data/data/sincell_with_class_5cl.RData")
+sce_sr = sce_sc_10x_5cl_qc
+Lib_all<- read.csv("data/PromethION_scmixology1/scpipe_output/Lib90.csv", row.names=1, stringsAsFactors=FALSE)
+sce_sr = sce_sr[,colnames(sce_sr) %in% rownames(Lib_all)]
+sce_sr$barcode_seq = Lib_all[colnames(sce_sr),"barcode_sequence"]
+rownames(sce_sr) = sce_sr@int_elementMetadata$ensembl_gene_id
+colnames(sce_sr) = sce_sr$barcode_seq 
+
+comm_bc = intersect(sce_sr$barcode_seq, sce_lr$barcode_seq)
+comm_gene = intersect(rownames(sce_sr), rownames(sce_lr))
+sce_sr = sce_sr[comm_gene,comm_bc]
+sce_lr = sce_lr[comm_gene,comm_bc]
+```
+
+```{r}
+expr="sc_mixology rep1"
+tmp_meta = as.data.frame(colData(sce_sr))[,c("number_of_genes","total_count_per_cell")]
+tmp_meta$experiment = expr
+tmp_meta$protocol = "short_read"
+tmp_meta1 = as.data.frame(colData(sce_lr))[,c("number_of_genes","total_count_per_cell")]
+tmp_meta1$experiment = expr
+tmp_meta1$protocol = "long_read"
+
+lib_size_df_mixology_rep1 = rbind(tmp_meta,tmp_meta1)
+```
+
+```{r}
+ggplot(data=lib_size_df_mixology_rep1,aes(x=experiment,y=total_count_per_cell,fill=protocol))+
+  geom_violin()+
+  scale_y_log10()+
+  theme_bw()
+```
+
+
+```{r}
+g_corr = cal_gene_corr(sce_sr, sce_lr)
+corr_df_mixology_rep1 = data.frame(cell_correlation=g_corr,experiment=rep( expr,length(g_corr)),stringsAsFactors = FALSE )
+```
+
+### pacbio
+
+```{r}
+sce_lr = create_sce_by_dir(datadir = "data/Pacbio_5cl/scpipe_output",organism = "hsapiens_gene_ensembl",gene_id_type = "ensembl_gene_id")
+sce_lr = calculate_QC_metrics(sce_lr)
+sce_lr = sce_lr[,sce_lr$total_count_per_cell>10 & sce_lr$total_count_per_cell<150000]
+sce_lr = detect_outlier(sce_lr,comp = 2)
+sce_lr = remove_outliers(sce_lr)
+Lib_10 <- read.csv("data/PromethION_scmixology1/scpipe_output/Lib10.1000.csv", row.names=1, stringsAsFactors=FALSE)
+sce_lr = sce_lr[,colnames(sce_lr) %in% rownames(Lib_10)]
+sce_lr$barcode_seq = Lib_10[colnames(sce_lr),"barcode_sequence"]
+colnames(sce_lr) = sce_lr$barcode_seq 
+
+load("~/git/CellBench_data/data/sincell_with_class_5cl.RData")
+sce_sr = sce_sc_10x_5cl_qc
+Lib_all<- read.csv("data/PromethION_scmixology1/scpipe_output/Lib90.csv", row.names=1, stringsAsFactors=FALSE)
+sce_sr = sce_sr[,colnames(sce_sr) %in% rownames(Lib_all)]
+sce_sr$barcode_seq = Lib_all[colnames(sce_sr),"barcode_sequence"]
+rownames(sce_sr) = sce_sr@int_elementMetadata$ensembl_gene_id
+colnames(sce_sr) = sce_sr$barcode_seq 
+
+comm_bc = intersect(sce_sr$barcode_seq, sce_lr$barcode_seq)
+comm_gene = intersect(rownames(sce_sr), rownames(sce_lr))
+sce_sr = sce_sr[comm_gene,comm_bc]
+sce_lr = sce_lr[comm_gene,comm_bc]
+```
+
+```{r}
+g_corr = cal_gene_corr(sce_sr, sce_lr)
+corr_df_pacbio = data.frame(cell_correlation=g_corr,experiment=rep( expr,length(g_corr)),stringsAsFactors = FALSE )
+```
+
+## batch2 with 10x v3 chemistry
+
+only promethion was used in this batch
+
+```{r}
+sce_lr = create_sce_by_dir(datadir = "data/PromethION_scmixology2/scpipe_output",organism = "hsapiens_gene_ensembl",gene_id_type = "ensembl_gene_id")
+sce_lr = calculate_QC_metrics(sce_lr)
+sce_lr = sce_lr[,sce_lr$total_count_per_cell>10 & sce_lr$total_count_per_cell<220000]
+sce_lr = detect_outlier(sce_lr,comp = 2)
+sce_lr = remove_outliers(sce_lr)
+sce_lr = sce_lr[,sce_lr$total_count_per_cell>20000]
+Lib_10 <- read.csv("data/PromethION_scmixology2/scpipe_output/Lib10.csv", row.names=1, stringsAsFactors=FALSE)
+sce_lr = sce_lr[,colnames(sce_lr) %in% rownames(Lib_10)]
+sce_lr$barcode_seq = Lib_10[colnames(sce_lr),"barcode_sequence"]
+colnames(sce_lr) = sce_lr$barcode_seq 
+
+
+sce_sr = create_sce_by_dir(datadir = "data/PromethION_scmixology2/scpipe_output/Illumina_all",organism = "hsapiens_gene_ensembl",gene_id_type = "ensembl_gene_id")
+sce_sr = calculate_QC_metrics(sce_sr)
+sce_sr = sce_sr[,sce_sr$total_count_per_cell>10]
+sce_sr = detect_outlier(sce_sr,comp = 2)
+sce_sr = remove_outliers(sce_sr)
+
+Lib_all<- read.csv("data/PromethION_scmixology2/scpipe_output/Illumina_all/Lib90.csv", row.names=1, stringsAsFactors=FALSE)
+sce_sr = sce_sr[,colnames(sce_sr) %in% rownames(Lib_all)]
+sce_sr$barcode_seq = Lib_all[colnames(sce_sr),"barcode_sequence"]
+#rownames(sce_sr) = sce_sr@int_elementMetadata$ensembl_gene_id
+colnames(sce_sr) = sce_sr$barcode_seq 
+
+
+comm_bc = intersect(sce_sr$barcode_seq, sce_lr$barcode_seq)
+comm_gene = intersect(rownames(sce_sr), rownames(sce_lr))
+sce_sr = sce_sr[comm_gene,comm_bc]
+sce_lr = sce_lr[comm_gene,comm_bc]
+```
+
+```{r}
+expr="sc_mixology rep2"
+tmp_meta = as.data.frame(colData(sce_sr))[,c("number_of_genes","total_count_per_cell")]
+tmp_meta$experiment = expr
+tmp_meta$protocol = "short_read"
+tmp_meta1 = as.data.frame(colData(sce_lr))[,c("number_of_genes","total_count_per_cell")]
+tmp_meta1$experiment = expr
+tmp_meta1$protocol = "long_read"
+
+lib_size_df_mixology_rep2 = rbind(tmp_meta,tmp_meta1)
+```
+
+```{r}
+ggplot(data=lib_size_df_mixology_rep2,aes(x=experiment,y=total_count_per_cell,fill=protocol))+
+  geom_violin()+
+  scale_y_log10()+
+  theme_bw()
+```
+
+```{r}
+g_corr = cal_gene_corr(sce_sr, sce_lr)
+corr_df_mixology_rep2 = data.frame(cell_correlation=g_corr,experiment=rep( expr,length(g_corr)),stringsAsFactors = FALSE )
+```
+
+# mouse muscle stem cells
+
+
+```{r}
+sce_lr = create_sce_by_dir(datadir = "data/PromethION_MSC/scpipe_output",organism = "mmusculus_gene_ensembl",gene_id_type = "ensembl_gene_id")
+sce_lr = calculate_QC_metrics(sce_lr)
+sce_lr = sce_lr[,sce_lr$total_count_per_cell>1000]
+sce_lr = detect_outlier(sce_lr,comp = 2)
+sce_lr = remove_outliers(sce_lr)
+sce_lr = sce_lr[,sce_lr$total_count_per_cell>5000]
+Lib_10 <- read.csv("data/PromethION_MSC/scpipe_output/MuSC_Lib10_top1k.csv", row.names=1, stringsAsFactors=FALSE)
+sce_lr = sce_lr[,colnames(sce_lr) %in% rownames(Lib_10)]
+sce_lr$barcode_seq = Lib_10[colnames(sce_lr),"barcode_sequence"]
+colnames(sce_lr) = sce_lr$barcode_seq 
+
+
+sce_sr = create_sce_by_dir(datadir = "data/PromethION_MSC/scpipe_output/Lib_all",organism = "mmusculus_gene_ensembl",gene_id_type = "ensembl_gene_id")
+sce_sr = calculate_QC_metrics(sce_sr)
+sce_sr = sce_sr[,sce_sr$total_count_per_cell>10]
+sce_sr = detect_outlier(sce_sr,comp = 2)
+sce_sr = sce_sr[,sce_sr$total_count_per_cell>5000]
+sce_sr = remove_outliers(sce_sr)
+
+Lib_all<- read.csv("data/PromethION_MSC/scpipe_output/Lib_all/MuSC_Lib90.csv", row.names=1, stringsAsFactors=FALSE)
+sce_sr = sce_sr[,colnames(sce_sr) %in% rownames(Lib_all)]
+sce_sr$barcode_seq = Lib_all[colnames(sce_sr),"barcode_sequence"]
+#rownames(sce_sr) = sce_sr@int_elementMetadata$ensembl_gene_id
+colnames(sce_sr) = sce_sr$barcode_seq 
+
+comm_bc = intersect(sce_sr$barcode_seq, sce_lr$barcode_seq)
+comm_gene = intersect(rownames(sce_sr), rownames(sce_lr))
+sce_sr = sce_sr[comm_gene,comm_bc]
+sce_lr = sce_lr[comm_gene,comm_bc]
+```
+
+
+```{r}
+expr="MSCs"
+tmp_meta = as.data.frame(colData(sce_sr))[,c("number_of_genes","total_count_per_cell")]
+tmp_meta$experiment = expr
+tmp_meta$protocol = "short_read"
+tmp_meta1 = as.data.frame(colData(sce_lr))[,c("number_of_genes","total_count_per_cell")]
+tmp_meta1$experiment = expr
+tmp_meta1$protocol = "long_read"
+
+lib_size_df_msc = rbind(tmp_meta,tmp_meta1)
+```
+
+```{r}
+ggplot(data=lib_size_df_msc,aes(x=experiment,y=total_count_per_cell,fill=protocol))+
+  geom_violin()+
+  scale_y_log10()+
+  theme_bw()
+```
+
+```{r}
+g_corr = cal_gene_corr(sce_sr, sce_lr)
+corr_df_msc = data.frame(cell_correlation=g_corr,experiment=rep( expr,length(g_corr)),stringsAsFactors = FALSE )
+```
+
+
+# CLL patient samples
+
+```{r}
+sce_lr = create_sce_by_dir(datadir = "data/PromethION_CLL/scpipe_output/longread",organism = "hsapiens_gene_ensembl",gene_id_type = "ensembl_gene_id")
+sce_lr = calculate_QC_metrics(sce_lr)
+sce_lr = sce_lr[,sce_lr$total_count_per_cell>1000 & sce_lr$total_count_per_cell<70000]
+rownames(sce_lr) = sapply(strsplit(rownames(sce_lr),"\\."),function(x){x[1]})
+#sce_lr = detect_outlier(sce_lr,comp = 2)
+#sce_lr = remove_outliers(sce_lr)
+  
+# sce_sr = create_sce_by_dir(datadir = "data/PromethION_CLL/scpipe_output/Illumina",organism = "hsapiens_gene_ensembl",gene_id_type = "ensembl_gene_id")
+# sce_sr = calculate_QC_metrics(sce_sr)
+# sce_sr = sce_sr[,sce_sr$total_count_per_cell>10]
+# sce_sr = detect_outlier(sce_sr,comp = 2)
+# sce_sr = remove_outliers(sce_sr)
+
+sce_sr <- read10xCounts("data/PromethION_CLL/filtered_feature_bc_matrix", col.names=TRUE)
+colnames(sce_sr) = sapply(strsplit(colnames(sce_sr), "-"),function(x){x[1]})
+
+
+# Lib_all<- read.csv("data/PromethION_CLL/scpipe_output/Illumina/Lib20.csv", row.names=1, stringsAsFactors=FALSE)
+# sce_sr = sce_sr[,colnames(sce_sr) %in% rownames(Lib_all)]
+# sce_sr$barcode_seq = Lib_all[colnames(sce_sr),"barcode_sequence"]
+# #rownames(sce_sr) = sce_sr@int_elementMetadata$ensembl_gene_id
+# colnames(sce_sr) = sce_sr$barcode_seq 
+
+comm_bc = intersect(colnames(sce_sr), colnames(sce_lr))
+comm_gene = intersect(rownames(sce_sr), rownames(sce_lr))
+sce_sr = sce_sr[comm_gene,comm_bc]
+sce_lr = sce_lr[comm_gene,comm_bc]
+
+g_corr = cal_gene_corr(sce_sr, sce_lr)
+
+sce_sr = sce_sr[,g_corr>0.5]
+sce_lr = sce_lr[,g_corr>0.5]
+```
+
+```{r}
+expr="CLL patient1"
+tmp_meta = as.data.frame(colData(sce_sr))[,c("number_of_genes","total_count_per_cell")]
+tmp_meta$experiment = expr
+tmp_meta$protocol = "short_read"
+tmp_meta1 = as.data.frame(colData(sce_lr))[,c("number_of_genes","total_count_per_cell")]
+tmp_meta1$experiment = expr
+tmp_meta1$protocol = "long_read"
+
+lib_size_df_cll1 = rbind(tmp_meta,tmp_meta1)
+```
+
+```{r}
+ggplot(data=lib_size_df_cll1,aes(x=experiment,y=total_count_per_cell,fill=protocol))+
+  geom_violin()+
+  scale_y_log10()+
+  theme_bw()
+```
+
+```{r}
+g_corr = cal_gene_corr(sce_sr, sce_lr)
+corr_df_cll1 = data.frame(cell_correlation=g_corr,experiment=rep( expr,length(g_corr)),stringsAsFactors = FALSE )
+```
+
+
+
+```{r}
+ggplot(data=lib_size_df_cll1,aes(x=experiment,y=total_count_per_cell,fill=protocol))+
+  geom_violin()+
+  scale_y_log10()+
+  theme_bw()
+```
+
+```{r}
+g_corr = cal_gene_corr(sce_sr, sce_lr)
+corr_df_cll1 = data.frame(cell_correlation=g_corr,experiment=rep( expr,length(g_corr)),stringsAsFactors = FALSE )
+```
+
+
+# summary and put all together
+
+
+```{r}
+lib_size_df_mixology_rep1$design="sc_mixology"
+lib_size_df_mixology_rep2$design="sc_mixology"
+lib_size_df_msc$design="MSCs"
+lib_size_df_cll1$design="CLL cells"
+lib_size_df = rbind(lib_size_df_mixology_rep1, 
+                lib_size_df_mixology_rep2, 
+                lib_size_df_msc,
+                lib_size_df_cll1)
+lib_size_df$design <- factor(lib_size_df$design,
+    levels = c('sc_mixology',"MSCs","CLL cells"),ordered = TRUE)
+```
+
+```{r}
+ggplot(data=lib_size_df,aes(x=experiment,y=total_count_per_cell,fill=protocol))+
+  geom_violin(alpha=0.7)+
+  scale_y_log10()+
+  labs(y="UMI count per cell")+
+    stat_summary(
+    fun.data = function(x){data.frame(y=max(x)+.3, label=paste0('n=', length(x)))}, 
+    geom = "text", 
+    hjust = 0.5,
+    vjust = 0.9,
+    show.legend = FALSE
+  )+
+  facet_grid(. ~ design, scale="free")+
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+ggsave(file="figs/UMI_count_summary.pdf",height = 4,width = 6.5)
+```
+
+
+```{r}
+corr_df_mixology_rep1$design="sc_mixology"
+corr_df_mixology_rep2$design="sc_mixology"
+corr_df_msc$design="MSCs"
+corr_df_cll1$design="CLL cells"
+corr_df = rbind(corr_df_mixology_rep1, 
+                corr_df_mixology_rep2, 
+                corr_df_msc,
+                corr_df_cll1)
+corr_df$design <- factor(corr_df$design,
+    levels = c('sc_mixology',"MSCs","CLL cells"),ordered = TRUE)
+```
+
+```{r}
+ggplot(data=corr_df,aes(x=experiment,y=cell_correlation,fill=design))+
+  geom_violin(show.legend = F,alpha=0.7)+
+  scale_y_log10()+
+  labs(y="Pearson correlation")+
+    stat_summary(
+    fun.data = function(x){data.frame(y=max(x)+0.03, label=paste0('n=', length(x)))}, 
+    geom = "text", 
+    hjust = 0.5,
+    vjust = 0.9,
+    show.legend = FALSE
+  )+
+  facet_grid(. ~ design, scale="free")+
+  theme_bw()+
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+ggsave(file="figs/cc_corr_summary.pdf",height = 4,width = 6.5)
+```
+

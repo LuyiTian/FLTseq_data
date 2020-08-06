@@ -1,0 +1,2253 @@
+---
+title: "differential transcript usage analysis"
+output: html_notebook
+---
+
+```{r,warning=FALSE,message=FALSE}
+library(ggplot2)
+library(scater)
+library(scran)
+library(limma)
+library(edgeR)
+library(org.Hs.eg.db)
+library(viridis)
+library(dplyr)
+library(tidyr)
+library(ggpubr)
+library(Seurat)
+library(rtracklayer)
+library(pheatmap)
+library(RColorBrewer)
+library(stringr)
+#library(DRIMSeq)
+library(ggbio)
+```
+
+```{r}
+filter_gene = function(sce,min_cell=10){
+  if (0.01*ncol(sce)>min_cell){
+    min_cell = 0.01*ncol(sce)
+  }
+  keep1 = (apply(counts(sce), 1, function(x) mean(x[x>0])) > 1)  # average count 
+  keep2 = (rowSums(counts(sce)>0) >min_cell )
+  sce = sce[(keep1 & keep2), ]
+  return(sce)
+}
+
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+DTU_analysis = function(data_dir){
+  transcript_count <- read.csv(file.path(data_dir,"FLTSA_output","transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"FLTSA_output","isoform_FSM_annotation.csv") , stringsAsFactors=FALSE)
+  transcript_count = transcript_count[match(isoform_FSM_annotation$transcript_id,transcript_count$transcript_id),]
+  transcript_count$FSM_match = isoform_FSM_annotation$FSM_match
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id","FSM_match"))]
+  tr_anno = transcript_count[,c("transcript_id","gene_id","FSM_match")]
+  mer_tmp = transcript_count %>%
+    group_by(FSM_match) %>%
+    summarise_at(cell_bcs,sum)
+  
+  tr_anno = tr_anno[match(mer_tmp$FSM_match,tr_anno$FSM_match),]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp[,-1]) ))
+  rownames(tr_sce) = mer_tmp$FSM_match
+  rowData(tr_sce) = DataFrame(tr_anno)
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  
+  rowData(tr_sce)$gene_id=gsub("\\..*","", rowData(tr_sce)$gene_id)
+  #gene_name = mapIds(org.Hs.eg.db,
+  #                   keys=rowData(tr_sce)$gene_id,
+  #                   column="SYMBOL",
+  #                   keytype="ENSEMBL",
+  #                   multiVals="first")
+  
+  #gene_name[is.na(gene_name)] = rowData(tr_sce)$gene_id[is.na(gene_name)]
+  rowData(tr_sce)$gene_name = rowData(tr_sce)$gene_id
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  rownames(cluster_barcode_anno) = cluster_barcode_anno$barcode_seq
+  comm_cells = intersect(colnames(tr_sce),rownames(cluster_barcode_anno))
+  
+  tr_sce = tr_sce[,comm_cells]
+  cluster_barcode_anno = cluster_barcode_anno[comm_cells,]
+  colData(tr_sce) = cbind(colData(tr_sce),DataFrame(cluster_barcode_anno))
+  
+  tr_sce_multi = tr_sce[rowData(tr_sce)$gene_name %in% names( table(rowData(tr_sce)$gene_name)[ table(rowData(tr_sce)$gene_name)>1]), ]
+  
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 4, wt = mean)
+  
+  tr_sce_multi = tr_sce_multi[rowData(tr_sce_multi)$transcript_id %in% row_meta$transcript_id,]
+
+  tmp_df = as.data.frame(counts(tr_sce_multi))
+  tmp_df$tr_id = rownames(tmp_df)
+  tr_sce_multi$barcode_seq = colnames(tr_sce_multi)
+  data_long <- gather(tmp_df, cell_id, cnt,colnames(tmp_df)[!(colnames(tmp_df)=="tr_id")])
+  tr_sce_multi$groups = as.factor(tr_sce_multi$groups)
+  data_long = left_join(data_long, as.data.frame(colData(tr_sce_multi)[,c("barcode_seq","groups")]),by=c("cell_id"="barcode_seq"))
+  data_long = data_long %>% group_by(tr_id, groups) %>% summarise(cnt=sum(cnt))
+  data_wide <- data_long %>% pivot_wider(id_cols=tr_id, names_from=groups,values_from=cnt)
+  all_grp = colnames(data_wide)[-1]
+  #data_wide = as.matrix(data_wide[,-1])
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% left_join(data_wide,by=c("FSM_match"="tr_id"))
+  get_rm = function(x){
+    tmp = row_meta
+    tmp$l = tmp[,x]
+    gc = tmp %>% group_by(gene_name) %>% dplyr::summarise(l_s=max(l))
+    tmp = tmp[tmp$gene_name %in% gc$gene_name[gc$l_s>10],]
+    tmp = tmp %>% group_by(gene_name) %>% top_n(n = 2)
+    return(tmp$transcript_id)
+  }
+  sel_tr = Reduce(union,lapply(all_grp,get_rm))
+  row_meta = row_meta[row_meta$transcript_id %in% sel_tr,]
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 4, wt = mean)
+  
+  ge_name = c()
+  X_value = c()
+  df = c()
+  p_value = c()
+  DTU_tr = c()
+  DTU_group = c()
+  for (ge in unique(row_meta$gene_name)){
+  #for (ge in sel_ge){
+    data_wide_tmp = data_wide[rowData(tr_sce_multi)$gene_name==ge,]
+    data_wide_tmp = data_wide_tmp[data_wide_tmp$tr_id %in% row_meta$FSM_match,]
+    rn = data_wide_tmp$tr_id
+    data_wide_tmp = as.matrix(data_wide_tmp[,-1])
+    rownames(data_wide_tmp) = rn
+    data_wide_tmp = data_wide_tmp[apply(data_wide_tmp,1,max)>15,apply(data_wide_tmp,2,max)>15]
+      if (!is.null(dim(data_wide_tmp))){
+          if(ncol(data_wide_tmp)>2 & nrow(data_wide_tmp)>1){
+            fit = chisq.test(data_wide_tmp)
+            ge_name = c(ge_name,ge)
+            X_value = c(X_value,fit$statistic)
+            df = c(df,fit$parameter)
+            p_value = c(p_value,fit$p.value)
+            cs = colSums( fit$residuals^2 )
+            DTU_group = c(DTU_group, names(cs[order(cs,decreasing = T)[1]]) )
+            if(nrow(data_wide_tmp)==2){
+              rs = rowSums(data_wide_tmp)
+              DTU_tr = c(DTU_tr,names(rs[order(rs)[1]]) )
+            }else{
+              hi1 = which(rowSums(data_wide_tmp)== max(rowSums(data_wide_tmp)))
+              if (length(hi1)>1){
+                re1 = rowSums(fit$residuals[hi1,]^2)
+              }else{
+                re1 = rowSums(fit$residuals[-hi1,]^2)
+              }
+              DTU_tr = c(DTU_tr, names(re1[order(re1,decreasing = T)[1]]))
+            }
+          }
+      }
+  }
+  res_df = data.frame(gene_name = ge_name,
+                    X_value = X_value,
+                    df=df,
+                    DTU_tr=DTU_tr,
+                    DTU_group=DTU_group,
+                    p_value=p_value,stringsAsFactors = FALSE)
+  res_df$adj_p=res_df$p_value*nrow(res_df)
+  res_df$adj_p=sapply(res_df$adj_p,function(x){min(1,x)})
+  res_df = res_df[order(res_df$p_value),]
+  return(res_df)
+}
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+data_dir = "data/PromethION_CLL2"
+result_CLL2 = DTU_analysis(data_dir)
+
+#data_dir = "data/PromethION_CLL267"
+#result_cll267 = DTU_analysis(data_dir)
+
+#data_dir = "data/PromethION_CLL152"
+#result_cll152 = DTU_analysis(data_dir)
+
+#data_dir = "data/PromethION_CLL153"
+#result_cll153 = DTU_analysis(data_dir)
+
+#data_dir = "data/PromethION_CLL318"
+#result_cll318 = DTU_analysis(data_dir)
+
+data_dir = "data/PromethION_scmixology1"
+result_mix1 = DTU_analysis(data_dir)
+
+data_dir = "data/PromethION_scmixology2"
+result_mix2 = DTU_analysis(data_dir)
+
+data_dir = "data/PromethION_MuSC"
+result_msc = DTU_analysis(data_dir)
+```
+
+
+
+```{r}
+table(result_CLL2$adj_p<0.01)
+table(result_cll267$adj_p<0.01)
+table(result_cll152$adj_p<0.01)
+table(result_cll153$adj_p<0.01)
+table(result_cll318$adj_p<0.01)
+table(result_mix1$adj_p<0.01)
+table(result_mix2$adj_p<0.01)
+table(result_msc$adj_p<0.01)
+```
+
+```{r}
+library(biomaRt)
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+gene_list=Reduce(union,list(result_CLL2$gene_name,result_cll267$gene_name,result_cll152$gene_name,result_cll153$gene_name,result_cll318$gene_name,result_mix1$gene_name,result_mix2$gene_name,result_msc$gene_name))
+convert_df=getBM(attributes = c("hgnc_symbol", "ensembl_gene_id"), filters = "ensembl_gene_id", values = gene_list, bmHeader = T, mart = mart)
+colnames(convert_df) = c("gene_symbol","gene_id")
+convert_df$gene_symbol[convert_df$gene_symbol==""]=convert_df$gene_id[convert_df$gene_symbol==""]
+
+result_CLL2 = result_CLL2 %>% left_join(convert_df,by=c("gene_name"="gene_id"))
+result_cll267 = result_cll267 %>% left_join(convert_df,by=c("gene_name"="gene_id"))
+result_cll152 = result_cll152 %>% left_join(convert_df,by=c("gene_name"="gene_id"))
+result_cll153 = result_cll153 %>% left_join(convert_df,by=c("gene_name"="gene_id"))
+result_cll318 = result_cll318 %>% left_join(convert_df,by=c("gene_name"="gene_id"))
+result_mix1 = result_mix1 %>% left_join(convert_df,by=c("gene_name"="gene_id"))
+result_mix2 = result_mix2 %>% left_join(convert_df,by=c("gene_name"="gene_id"))
+
+mart <- useMart(biomart = "ensembl", dataset = "mmusculus_gene_ensembl")
+gene_list = result_msc$gene_name
+convert_df=getBM(attributes = c("external_gene_name", "ensembl_gene_id"), filters = "ensembl_gene_id", values = gene_list, bmHeader = T, mart = mart)
+colnames(convert_df) = c("gene_symbol","gene_id")
+#convert_df$gene_symbol[convert_df$gene_symbol==""]=convert_df$gene_id[convert_df$gene_symbol==""]
+result_msc = result_msc %>% left_join(convert_df,by=c("gene_name"="gene_id"))
+
+save(result_CLL2, result_cll267, result_cll152, result_cll153, result_cll318, result_mix1, result_mix2, result_msc,file="DTU_chisquare_test.RData")
+```
+
+```{r}
+write.csv(result_CLL2,file="data/processed_files/DTU_CLL2.csv",row.names = FALSE)
+write.csv(result_mix1,file="data/processed_files/DTU_scmix1.csv",row.names = FALSE)
+write.csv(result_mix2,file="data/processed_files/DTU_scmix2.csv",row.names = FALSE)
+write.csv(result_msc,file="data/processed_files/DTU_MuSC.csv",row.names = FALSE)
+```
+
+
+```{r}
+result_cll318[result_cll318$gene_symbol=="BCL2",]
+result_mix2[grepl("^CD",result_mix2$gene_symbol),]
+```
+
+```{r}
+length(intersect(result_mix1$gene_symbol[result_mix1$adj_p<0.01], result_mix2$gene_symbol[result_mix2$adj_p<0.01]))
+```
+
+
+```{r}
+length(intersect(result_mix1$gene_symbol[result_mix1$adj_p<0.01], result_mix2$gene_symbol[result_mix2$adj_p<0.01]))/length(result_mix1$gene_symbol[result_mix1$adj_p<0.01])
+```
+
+
+```{r}
+intersect(result_mix1$gene_symbol[1:150], result_mix2$gene_symbol[1:150])
+```
+
+
+```{r}
+head(result_mix1,n=50)
+```
+
+
+```{r}
+
+```
+
+```{r}
+library(VennDiagram)
+scmix1 = result_mix1$gene_symbol[result_mix1$adj_p<0.01]
+scmix2 = result_mix2$gene_symbol[result_mix2$adj_p<0.01]
+cll2 = result_CLL2$gene_symbol[result_CLL2$adj_p<0.01]
+msc = result_msc$gene_symbol[result_msc$adj_p<0.01]
+msc = toupper(msc)
+
+comm_ge = Reduce(intersect,list(scmix1, scmix2, cll2,msc))
+comm_ge
+
+library(UpSetR)
+library(ComplexHeatmap)
+mat = list_to_matrix(list(scmix1, scmix2, cll2,msc))
+colnames(mat) = c("scmixology1","scmixology2","CLL2","MuSC")
+
+pdf("figs/upset_plot_DTU.pdf",width = 5,height = 2.5)
+upset(as.data.frame(mat))
+dev.off()
+```
+
+
+```{r}
+mix_combined = result_mix1
+mix_combined = mix_combined %>% inner_join(result_mix2,by=c("gene_name"="gene_name"))
+mix_combined = mix_combined[mix_combined$adj_p.x<0.001 & mix_combined$adj_p.y<0.001,]
+```
+
+```{r}
+sig_gene = result_msc$gene_name[result_msc$adj_p<0.001]
+write.csv(sig_gene,file="tmp_sig_gene.csv",quote = FALSE,row.names = FALSE)
+
+
+```
+
+
+```{r}
+get_sig_df = function(df,experiment){
+  tmp = df[,c("adj_p", "gene_symbol")]
+  tmp$sig = ">=0.01"
+  tmp$sig[tmp$adj_p<0.01] = "<0.01"
+  tmp$experiment = experiment
+  return(tmp)
+}
+df = list()
+df[[1]] = get_sig_df(result_CLL2,"CLL2")
+df[[2]]  = get_sig_df(result_cll267,"CLL267")
+df[[3]] = get_sig_df(result_cll152,"CLL152")
+df[[4]]  = get_sig_df(result_cll153,"CLL153")
+df[[5]]  = get_sig_df(result_cll318,"CLL318")
+df[[6]]  = get_sig_df(result_mix1,"scmixology1")
+df[[7]]  = get_sig_df(result_mix2,"scmixology2")
+df[[8]]  = get_sig_df(result_msc,"MSC")
+
+sig_combined = Reduce(rbind,df)
+sig_combined$sig = factor(sig_combined$sig,levels = c(">=0.01","<0.01"))
+sample_names = c('scmixology1',"scmixology2","MSC","CLL2","CLL267","CLL152","CLL153","CLL318")
+sig_combined$experiment <- factor(sig_combined$experiment,
+                             levels = sample_names,ordered = TRUE)
+```
+
+
+```{r}
+sig_combined = sig_combined[sig_combined$experiment %in% c("scmixology1","scmixology2","MSC","CLL2"),]
+ggplot(data=sig_combined,aes(x=experiment,fill=sig))+
+  geom_bar(alpha=0.85)+
+  theme_bw()+
+  labs(y="number of genes",fill="adjusted p value")+
+  scale_fill_brewer(palette = "Set1",direction = -1)+
+  theme(legend.position="top",axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/DTU_significant_summary.pdf",width = 3,height = 3)
+```
+
+
+
+
+# genes with DTU on sample CLL2
+
+```{r}
+CLL2_lib20_srt <- readRDS("~/Dropbox/research/sc_longread/Rachel/short_reads/CLL2_lib20_srt.Rds")
+```
+
+```{r}
+DimPlot(CLL2_lib20_srt,label = T)
+```
+```{r}
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[,1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[,2],col=CLL2_lib20_srt@assays$SCT@data["RPS24",]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression")+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/umap_CLL2_RPS24_genelevel.pdf",width = 3,height = 3)
+```
+
+
+```{r}
+CLL2_lib20_srt$cell_type = "CLL"
+CLL2_lib20_srt$cell_type[CLL2_lib20_srt$seurat_clusters %in% c(5,9)] = "normal"
+```
+
+```{r}
+
+```
+
+
+
+
+
+
+```{r}
+data_dir = "data/PromethION_CLL2"
+  transcript_count <- read.csv(file.path(data_dir,"FLTSA_output","transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"FLTSA_output","isoform_FSM_annotation.csv") , stringsAsFactors=FALSE)
+  isoform_FSM_annotation = isoform_FSM_annotation[order(isoform_FSM_annotation$total_count,decreasing = T),]
+  transcript_count = transcript_count[match(isoform_FSM_annotation$transcript_id,transcript_count$transcript_id),]
+  transcript_count$FSM_match = isoform_FSM_annotation$FSM_match
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id","FSM_match"))]
+  tr_anno = transcript_count[,c("transcript_id","gene_id","FSM_match")]
+  mer_tmp = transcript_count %>%
+    group_by(FSM_match) %>%
+    summarise_at(cell_bcs,sum)
+  
+  tr_anno = tr_anno[match(mer_tmp$FSM_match,tr_anno$FSM_match),]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp[,-1]) ))
+  rownames(tr_sce) = mer_tmp$FSM_match
+  rowData(tr_sce) = DataFrame(tr_anno)
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  
+  rowData(tr_sce)$gene_id=gsub("\\..*","", rowData(tr_sce)$gene_id)
+  #gene_name = mapIds(org.Hs.eg.db,
+  #                   keys=rowData(tr_sce)$gene_id,
+  #                   column="SYMBOL",
+  #                   keytype="ENSEMBL",
+  #                   multiVals="first")
+  
+  #gene_name[is.na(gene_name)] = rowData(tr_sce)$gene_id[is.na(gene_name)]
+  rowData(tr_sce)$gene_name = rowData(tr_sce)$gene_id
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  rownames(cluster_barcode_anno) = cluster_barcode_anno$barcode_seq
+  comm_cells = intersect(colnames(tr_sce),rownames(cluster_barcode_anno))
+  
+  tr_sce = tr_sce[,comm_cells]
+  cluster_barcode_anno = cluster_barcode_anno[comm_cells,]
+  colData(tr_sce) = cbind(colData(tr_sce),DataFrame(cluster_barcode_anno))
+  
+  tr_sce_multi = tr_sce[rowData(tr_sce)$gene_name %in% names( table(rowData(tr_sce)$gene_name)[ table(rowData(tr_sce)$gene_name)>1]), ]
+  
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 4, wt = mean)
+  
+  tr_sce_multi = tr_sce_multi[rowData(tr_sce_multi)$transcript_id %in% row_meta$transcript_id,]
+  tr_sce_multi = logNormCounts(tr_sce_multi)
+  colnames(tr_sce_multi) = paste(colnames(tr_sce_multi),"1",sep="-")
+```
+
+```{r}
+#tr_sce_multi = tr_sce_multi[,colnames(tr_sce_multi) %in% ]
+#colnames(tr_sce_multi) = paste(colnames(tr_sce_multi),"1",sep="-")
+result_CLL2_sel = result_CLL2[result_CLL2$adj_p<0.05,]
+result_CLL2_sel = result_CLL2[result_CLL2$gene_symbol %in% c(surface_pro$`ENTREZ gene symbol`,surface_pro$CD), ]
+pdf("figs/top_DTU_CLL2_sp.pdf",width = 6,height = 6)
+for (ge_ix in 1:40) {
+  ge = result_CLL2_sel$gene_name[ge_ix]
+  ge_name = result_CLL2_sel$gene_symbol[ge_ix]
+  tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+  expr = logcounts(tr_sce_multi)[tr_na,]
+  #expr = t(scale(t(expr)))
+  expr = scale(expr)
+  expr[expr<(-2.5)] = -2.5
+  expr[expr>(2.5)] = 2.5
+  gg_l = list()
+  for (ix in 1:(min(4,nrow(expr)))){
+    tr = rownames(expr)[ix]
+    plot_df = data.frame(Dim1=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),1],
+                         Dim2=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),2],
+                         expression=expr[tr,])
+    gg_l[[ix]] = ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=1)+
+      labs(title=tr)+
+      scale_colour_gradient2(low = "blue", mid = "white",high = "red", na.value = NA)+
+      theme_bw()+
+      theme(text = element_text(size=7))
+  }
+  figure = ggarrange(plotlist = gg_l,common.legend = T,align="hv",legend="right")
+  print(annotate_figure(figure,
+                  top = text_grob(paste(ge,ge_name,sep=" - "))))
+}
+dev.off()
+
+
+
+result_splicing = result_CLL2[result_CLL2$gene_name %in% c("ENSG00000096063", "ENSG00000161547", "ENSG00000100109", "ENSG00000054118", "ENSG00000112081", "ENSG00000033030", "ENSG00000175467", "ENSG00000122566", "ENSG00000198563", "ENSG00000123136", "ENSG00000131876", "ENSG00000130332", "ENSG00000175324", "ENSG00000104897", "ENSG00000275895", "ENSG00000164548", "ENSG00000136450", "ENSG00000060688", "ENSG00000188529", "ENSG00000168066", "ENSG00000150316", "ENSG00000135486", "ENSG00000169813", "ENSG00000115875", "ENSG00000070495", "ENSG00000171566", "ENSG00000039123"),]
+
+
+pdf("figs/top_DTU_splicing_CLL2.pdf",width = 6,height = 6)
+for (ge_ix in 1:nrow(result_splicing)) {
+  ge = result_splicing$gene_name[ge_ix]
+  ge_name = result_splicing$gene_symbol[ge_ix]
+  tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+  expr = logcounts(tr_sce_multi)[tr_na,]
+  #expr = t(scale(t(expr)))
+  expr = scale(expr)
+  expr[expr<(-2.5)] = -2.5
+  expr[expr>(2.5)] = 2.5
+  gg_l = list()
+  for (ix in 1:(min(4,nrow(expr)))){
+    tr = rownames(expr)[ix]
+    plot_df = data.frame(Dim1=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),1],
+                         Dim2=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),2],
+                         expression=expr[tr,])
+    gg_l[[ix]] = ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=1)+
+      labs(title=tr)+
+      scale_colour_gradient2(low = "blue", mid = "white",high = "red", na.value = NA)+
+      theme_bw()+
+      theme(text = element_text(size=7))
+  }
+  figure = ggarrange(plotlist = gg_l,common.legend = T,align="hv",legend="right")
+  print(annotate_figure(figure,
+                  top = text_grob(paste(ge,ge_name,sep=" - "))))
+}
+dev.off()
+
+```
+
+
+```{r}
+snn_mat = as.matrix(CLL2_lib20_srt@graphs$SCT_snn)
+
+isoform_gff = import(file.path(data_dir,"FLTSA_output","isoform_annotated.filtered.gff3"))
+isoform_gff$Parent = as.character(isoform_gff$Parent)
+isoform_gff$transcript_id= unlist(lapply(strsplit(isoform_gff$Parent, split = ":"),function(x){x[2]}))
+#isoform_gff$transcript_id = gsub("\\.","", isoform_gff$transcript_id)
+```
+
+
+## ENSG00000054118 − THRAP3
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000054118"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+#ggsave("figs/isoform_SRSF3_CLL2.pdf",width = 4.5,height = 3.5)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(CLL2_lib20_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(CLL2_lib20_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+#ggsave("UMAP_SRSF3_CLL2_715.pdf",width = 3,height = 3)
+```
+
+## ENSG00000112081 − SRSF3
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000112081"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_SRSF3_CLL2.pdf",width = 4.5,height = 3.5)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(CLL2_lib20_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(CLL2_lib20_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("UMAP_SRSF3_CLL2_715.pdf",width = 3,height = 3)
+```
+```{r}
+idx=2
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("UMAP_SRSF3_CLL2_442.pdf",width = 3,height = 3)
+```
+
+## ENSG00000161547 − SRSF2
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000161547"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_SRSF2_CLL2.pdf",width = 4.5,height = 3.5)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(CLL2_lib20_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(CLL2_lib20_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("UMAP_SRSF2_CLL2_1.pdf",width = 3,height = 3)
+```
+```{r}
+idx=3
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("UMAP_SRSF2_CLL2_485.pdf",width = 3,height = 3)
+```
+
+```{r}
+idx=4
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("UMAP_SRSF2_CLL2_202.pdf",width = 3,height = 3)
+```
+
+## ENSG00000141682 − PMAIP1
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000141682"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_PMAIP1_CLL2.pdf",width = 5,height = 4)
+```
+
+## ENSG00000143119 CD53
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000143119"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+#ggsave("figs/isoform_RPS24_CLL2.pdf",width = 5,height = 4)
+```
+
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(CLL2_lib20_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(CLL2_lib20_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+
+```{r}
+tr_rank = c("ENST00000271324.6","ENSG00000143119.14_110873148_110899922_5","ENSG00000143119.14_110873148_110899922_3","ENSG00000143119.14_110873148_110892048_1")
+
+col_anno = CLL2_lib20_srt@meta.data[,"cell_type",drop=FALSE]
+annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_colnames = FALSE,show_rownames = FALSE,annotation_col=col_anno,annotation_colors = annotation_colors,color=BlueAndRed(),
+         filename="figs/heatmap_CLL2_DTU_CD52.pdf",
+         width = 3,height = 3)
+```
+
+```{r}
+idx=3
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = T)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+
+
+## CLL2 RPS24
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000138326"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_RPS24_CLL2.pdf",width = 5,height = 4)
+```
+
+
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(CLL2_lib20_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(CLL2_lib20_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+
+```{r}
+tr_rank = c("ENST00000613865.5","ENST00000372360.9","ENST00000360830.9","ENST00000435275.5")
+
+col_anno = CLL2_lib20_srt@meta.data[,"cell_type",drop=FALSE]
+annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_colnames = FALSE,show_rownames = FALSE,annotation_col=col_anno,annotation_colors = annotation_colors,color=BlueAndRed(),filename="figs/heatmap_DTU_RPS24.pdf",width = 4,height = 3)
+```
+
+
+
+
+```{r}
+idx=4
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[,1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[,2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_RPS24_1.pdf",width = 4,height = 4)
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[,1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[,2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_RPS24_2.pdf",width = 4,height = 4)
+```
+
+## CLL2 CD47
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000196776"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_CD47_CLL2.pdf",width = 4,height = 3.5)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(CLL2_lib20_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(CLL2_lib20_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+
+```{r}
+tr_rank = tr_na[order(rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"mean"],decreasing = T)]
+
+col_anno = CLL2_lib20_srt@meta.data[,"cell_type",drop=FALSE]
+annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_colnames = FALSE,show_rownames = FALSE,annotation_col=col_anno,annotation_colors = annotation_colors,color=BlueAndRed(),filename="figs/heatmap_DTU_CD47_CLL2.pdf",width = 3,height = 3)
+```
+
+
+
+
+```{r}
+idx=4
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_CLL2_CD47_309.pdf",width = 3,height = 3)
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_CLL2_CD47_2.pdf",width = 3,height = 3)
+```
+
+
+```{r}
+idx=3
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = T)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+#ggsave("figs/UMAP_DTU_RPS24_1.pdf",width = 4,height = 4)
+```
+
+## CLL2 CD45 ENSG00000081237
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000081237"
+#sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+#sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+sel_fsm = c("ENST00000348564.11","ENST00000530727.5","ENST00000442510.8","ENSG00000081237.20_198639040_198748176_1")
+sel_tr = sel_fsm
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_CD45_CLL2.pdf",width = 5.5,height = 3.5)
+```
+
+```{r}
+#tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+tr_na = sel_tr
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(CLL2_lib20_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(CLL2_lib20_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+
+```{r}
+tr_rank = c("ENST00000442510.8","ENSG00000081237.20_198639040_198748176_1","ENST00000530727.5","ENST00000348564.11")
+
+col_anno = CLL2_lib20_srt@meta.data[,"cell_type",drop=FALSE]
+annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_colnames = FALSE,show_rownames = T,annotation_col=col_anno,annotation_colors = annotation_colors,color=BlueAndRed(),
+         #filename="figs/heatmap_DTU_CD47_CLL2.pdf",
+         width = 6,height = 3)
+```
+
+
+
+
+```{r}
+idx=3
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = T)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=mean(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+#ggsave("figs/UMAP_DTU_CLL2_CD45RABC.pdf",width = 3,height = 3)
+ggsave("figs/UMAP_DTU_CLL2_CD45RABC_with_legend.pdf",width = 4,height = 3)
+```
+
+```{r}
+FeaturePlot(CLL2_lib20_srt,"CD45RA")
+```
+
+```{r}
+FeaturePlot(CLL2_lib20_srt,"CD16")
+```
+
+```{r}
+tmp_val = CLL2_lib20_srt@assays$ADT@scale.data["CD45RA",]
+tmp_val[tmp_val>quantile(tmp_val,0.99)] = quantile(tmp_val,0.99)
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[,1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[,2],col=tmp_val),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title="CD45RA")+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50] )+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/umap_CLL2_CD45RA_antibody.pdf",width = 3,height = 3)
+```
+
+```{r}
+
+
+tmp_val = CLL2_lib20_srt@assays$SCT@data["PTPRC",]
+tmp_val[tmp_val>quantile(tmp_val,0.99)] = quantile(tmp_val,0.99)
+ggplot()+
+      geom_point(aes(x=CLL2_lib20_srt@reductions$umap@cell.embeddings[,1],y=CLL2_lib20_srt@reductions$umap@cell.embeddings[,2],col=tmp_val),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title="PTPRC (CD45)")+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50] )+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/umap_CLL2_CD45_genelevel.pdf",width = 3,height = 3)
+```
+
+
+# genes with DTU on sample scmixology 1 and 2
+
+```{r}
+scmix1_srt <- readRDS("data/processed_files/scmix1_srt.Rds")
+scmix1_srt = RunPCA(scmix1_srt)
+scmix1_srt = FindNeighbors(scmix1_srt, dims = 1:10)
+scmix1_srt = RunUMAP(scmix1_srt,dims = 1:10)
+DimPlot(scmix1_srt,group.by = "cell_type")
+```
+
+```{r}
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[,1],y=scmix1_srt@reductions$umap@cell.embeddings[,2],col=scmix1_srt@assays$SCT@data["RPS24",]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression")+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/umap_scmix1_RPS24_genelevel.pdf",width = 3,height = 3)
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+data_dir = "data/PromethION_scmixology1"
+  transcript_count <- read.csv(file.path(data_dir,"FLTSA_output","transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"FLTSA_output","isoform_FSM_annotation.csv") , stringsAsFactors=FALSE)
+  transcript_count = transcript_count[match(isoform_FSM_annotation$transcript_id,transcript_count$transcript_id),]
+  transcript_count$FSM_match = isoform_FSM_annotation$FSM_match
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id","FSM_match"))]
+  tr_anno = transcript_count[,c("transcript_id","gene_id","FSM_match")]
+  mer_tmp = transcript_count %>%
+    group_by(FSM_match) %>%
+    summarise_at(cell_bcs,sum)
+  
+  tr_anno = tr_anno[match(mer_tmp$FSM_match,tr_anno$FSM_match),]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp[,-1]) ))
+  rownames(tr_sce) = mer_tmp$FSM_match
+  rowData(tr_sce) = DataFrame(tr_anno)
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  
+  rowData(tr_sce)$gene_id=gsub("\\..*","", rowData(tr_sce)$gene_id)
+  #gene_name = mapIds(org.Hs.eg.db,
+  #                   keys=rowData(tr_sce)$gene_id,
+  #                   column="SYMBOL",
+  #                   keytype="ENSEMBL",
+  #                   multiVals="first")
+  
+  #gene_name[is.na(gene_name)] = rowData(tr_sce)$gene_id[is.na(gene_name)]
+  rowData(tr_sce)$gene_name = rowData(tr_sce)$gene_id
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  rownames(cluster_barcode_anno) = cluster_barcode_anno$barcode_seq
+  comm_cells = intersect(colnames(tr_sce),rownames(cluster_barcode_anno))
+  
+  tr_sce = tr_sce[,comm_cells]
+  cluster_barcode_anno = cluster_barcode_anno[comm_cells,]
+  colData(tr_sce) = cbind(colData(tr_sce),DataFrame(cluster_barcode_anno))
+  
+  tr_sce_multi = tr_sce[rowData(tr_sce)$gene_name %in% names( table(rowData(tr_sce)$gene_name)[ table(rowData(tr_sce)$gene_name)>1]), ]
+  
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 4, wt = mean)
+  
+  tr_sce_multi = tr_sce_multi[rowData(tr_sce_multi)$transcript_id %in% row_meta$transcript_id,]
+  tr_sce_multi = logNormCounts(tr_sce_multi)
+  #colnames(tr_sce_multi) = paste(colnames(tr_sce_multi),"1",sep="-")
+  tr_sce_multi = tr_sce_multi[,colnames(tr_sce_multi) %in% colnames(scmix1_srt)]
+```
+
+
+```{r}
+
+#colnames(tr_sce_multi) = paste(colnames(tr_sce_multi),"1",sep="-")
+
+result_splicing = result_mix1[result_mix1$gene_name %in% c("ENSG00000168066", "ENSG00000099783", "ENSG00000135486", "ENSG00000179950", "ENSG00000173914", "ENSG00000167978", "ENSG00000122566", "ENSG00000198563", "ENSG00000173933", "ENSG00000131981", "ENSG00000125835", "ENSG00000164548", "ENSG00000115524", "ENSG00000102103", "ENSG00000139218", "ENSG00000182004", "ENSG00000100138", "ENSG00000136937"),]
+
+
+pdf("figs/top_DTU_scmix1.pdf",width = 6,height = 6)
+for (ge_ix in 1:40) {
+  ge = result_mix1$gene_name[ge_ix]
+  ge_name = result_mix1$gene_symbol[ge_ix]
+  tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+  expr = logcounts(tr_sce_multi)[tr_na,]
+  #expr = t(scale(t(expr)))
+  expr = scale(expr)
+  expr[expr<(-2.5)] = -2.5
+  expr[expr>(2.5)] = 2.5
+  gg_l = list()
+  for (ix in 1:(min(4,nrow(expr)))){
+    tr = rownames(expr)[ix]
+    plot_df = data.frame(Dim1=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),1],
+                         Dim2=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),2],
+                         expression=expr[tr,])
+    gg_l[[ix]] = ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=1)+
+      labs(title=tr)+
+      scale_colour_gradient2(low = "blue", mid = "white",high = "red", na.value = NA)+
+      theme_bw()+
+      theme(text = element_text(size=7))
+  }
+  figure = ggarrange(plotlist = gg_l,common.legend = T,align="hv",legend="right")
+  print(annotate_figure(figure,
+                  top = text_grob(paste(ge,ge_name,sep=" - "))))
+}
+dev.off()
+
+
+
+pdf("figs/top_DTU_splicing_scmix1.pdf",width = 6,height = 6)
+for (ge_ix in 1:nrow(result_splicing)) {
+  ge = result_splicing$gene_name[ge_ix]
+  ge_name = result_splicing$gene_symbol[ge_ix]
+  tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+  expr = logcounts(tr_sce_multi)[tr_na,]
+  #expr = t(scale(t(expr)))
+  expr = scale(expr)
+  expr[expr<(-2.5)] = -2.5
+  expr[expr>(2.5)] = 2.5
+  gg_l = list()
+  for (ix in 1:(min(4,nrow(expr)))){
+    tr = rownames(expr)[ix]
+    plot_df = data.frame(Dim1=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),1],
+                         Dim2=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),2],
+                         expression=expr[tr,])
+    gg_l[[ix]] = ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=1)+
+      labs(title=tr)+
+      scale_colour_gradient2(low = "blue", mid = "white",high = "red", na.value = NA)+
+      theme_bw()+
+      theme(text = element_text(size=7))
+  }
+  figure = ggarrange(plotlist = gg_l,common.legend = T,align="hv",legend="right")
+  print(annotate_figure(figure,
+                  top = text_grob(paste(ge,ge_name,sep=" - "))))
+}
+dev.off()
+```
+
+
+```{r}
+snn_mat = as.matrix(scmix1_srt@graphs$SCT_snn)
+
+isoform_gff = import(file.path(data_dir,"FLTSA_output","isoform_annotated.filtered.gff3"))
+isoform_gff$Parent = as.character(isoform_gff$Parent)
+isoform_gff$transcript_id= unlist(lapply(strsplit(isoform_gff$Parent, split = ":"),function(x){x[2]}))
+#isoform_gff$transcript_id = gsub("\\.","", isoform_gff$transcript_id)
+```
+
+# ENSG00000117450 - PRDX1
+
+```{r}
+ge = "ENSG00000117450"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_tr = c("ENST00000319248.13","ENSG00000117450.14_45511051_45522856_1")
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+sel_fsm =  c("ENST00000319248.13","ENSG00000117450.14_45511051_45522856_1")
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_PRDX1_scmix1.pdf",width = 5,height = 2)
+```
+
+```{r}
+tr_na = sel_fsm
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(scmix1_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(scmix1_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+idx=2
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.2,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_PRDX1_1.pdf",width = 3,height = 3)
+```
+
+```{r}
+idx=4
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.2,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_PRDX1_2.pdf",width = 3,height = 3)
+```
+
+# ENSG00000102103 − PQBP1
+
+```{r}
+ge = "ENSG00000102103"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_tr = sel_tr[1:4]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+sel_fsm = sel_fsm[1:4]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_PQBP1_scmix1.pdf",width = 5,height = 3.5)
+```
+
+```{r}
+tr_na = sel_fsm
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(scmix1_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(scmix1_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.2,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_PQBP1_563.pdf",width = 3,height = 3)
+```
+
+```{r}
+idx=3
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.2,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_PQBP1_146.pdf",width = 3,height = 3)
+```
+
+# ENSG00000026508 - CD44
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000026508"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_tr = sel_tr[1:4]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+sel_fsm = sel_fsm[1:4]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_CD44_scmix1.pdf",width = 5,height = 4)
+```
+
+```{r}
+tr_na = sel_fsm
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(scmix1_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(scmix1_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+#tr_rank = tr_na[order(rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"mean"],decreasing = T)]
+tr_rank = c("ENST00000433892.6","ENST00000263398.10","ENST00000415148.6","ENSG00000026508.19_35139171_35230027_3")
+col_anno = scmix1_srt@meta.data[,"cell_type",drop=FALSE]
+#annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_rownames  = FALSE,show_colnames = FALSE,annotation_col=col_anno,color=BlueAndRed(),
+         filename="figs/heatmap_DTU_CD44_scmix1.pdf",
+         width = 4,height = 3)
+```
+
+```{r}
+idx=4
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.2,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_CD44_892.pdf",width = 4,height = 4)
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.2,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_CD44_001.pdf",width = 4,height = 4)
+```
+
+# ENSG00000138326 - RPS24
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000138326"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_RPS24_scmix1.pdf",width = 5,height = 4)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(scmix1_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(scmix1_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+#tr_rank = tr_na[order(rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"mean"],decreasing = T)]
+tr_rank = c("ENST00000613865.5","ENST00000372360.9","ENST00000360830.9","ENST00000435275.5")
+col_anno = scmix1_srt@meta.data[,"cell_type",drop=FALSE]
+#annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_rownames  = FALSE,show_colnames = FALSE,annotation_col=col_anno,color=BlueAndRed(),filename="figs/heatmap_DTU_RPS24_scmix1.pdf",width = 3,height = 3)
+```
+
+```{r}
+idx=2
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_RPS24_360.pdf",width = 4,height = 4)
+```
+
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_RPS24_830.pdf",width = 4,height = 4)
+```
+
+
+# ENSG00000196776 − CD47
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000196776"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_CD47_scmix1.pdf",width = 5,height = 4)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(scmix1_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(scmix1_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+tr_rank = tr_na[order(rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"mean"],decreasing = T)]
+
+col_anno = scmix1_srt@meta.data[,"cell_type",drop=FALSE]
+#annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_rownames = FALSE,show_colnames = FALSE,annotation_col=col_anno,color=BlueAndRed(),filename="figs/heatmap_DTU_CD47_scmix1.pdf",width = 5,height = 4)
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.3,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"), 
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_CD47_1.pdf",width = 4,height = 4)
+```
+
+
+```{r}
+idx=2
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix1_CD47_2.pdf",width = 4,height = 4)
+```
+
+
+# ENSG00000067225 − PKM
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000067225"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+#ggsave("figs/isoform_CD47_scmix1.pdf",width = 5,height = 4)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(scmix1_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(scmix1_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+tr_rank = tr_na[order(rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"mean"],decreasing = T)]
+
+col_anno = scmix1_srt@meta.data[,"cell_type",drop=FALSE]
+#annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_colnames = FALSE,annotation_col=col_anno,color=BlueAndRed(),
+         #filename="figs/heatmap_DTU_RPS24_scmix1.pdf",
+         width = 6,height = 4)
+```
+
+```{r}
+idx=3
+ggplot()+
+      geom_point(aes(x=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix1_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.3,show.legend = T)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"), 
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+#ggsave("figs/UMAP_DTU_scmix1_CD47_1.pdf",width = 4,height = 4)
+```
+
+# sxmixology2
+
+```{r}
+scmix2_srt <- readRDS("data/processed_files/scmix2_srt.Rds")
+scmix2_srt = scmix2_srt[,scmix2_srt$nFeature_RNA>5000]
+scmix2_srt = RunPCA(scmix2_srt)
+scmix2_srt = FindNeighbors(scmix2_srt, dims = 1:10)
+scmix2_srt = RunUMAP(scmix2_srt,dims = 1:10)
+DimPlot(scmix2_srt,group.by = "cell_type")
+```
+
+```{r}
+data_dir = "data/PromethION_scmixology2"
+  transcript_count <- read.csv(file.path(data_dir,"FLTSA_output","transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"FLTSA_output","isoform_FSM_annotation.csv") , stringsAsFactors=FALSE)
+  transcript_count = transcript_count[match(isoform_FSM_annotation$transcript_id,transcript_count$transcript_id),]
+  transcript_count$FSM_match = isoform_FSM_annotation$FSM_match
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id","FSM_match"))]
+  tr_anno = transcript_count[,c("transcript_id","gene_id","FSM_match")]
+  mer_tmp = transcript_count %>%
+    group_by(FSM_match) %>%
+    summarise_at(cell_bcs,sum)
+  
+  tr_anno = tr_anno[match(mer_tmp$FSM_match,tr_anno$FSM_match),]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp[,-1]) ))
+  rownames(tr_sce) = mer_tmp$FSM_match
+  rowData(tr_sce) = DataFrame(tr_anno)
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  
+  rowData(tr_sce)$gene_id=gsub("\\..*","", rowData(tr_sce)$gene_id)
+  #gene_name = mapIds(org.Hs.eg.db,
+  #                   keys=rowData(tr_sce)$gene_id,
+  #                   column="SYMBOL",
+  #                   keytype="ENSEMBL",
+  #                   multiVals="first")
+  
+  #gene_name[is.na(gene_name)] = rowData(tr_sce)$gene_id[is.na(gene_name)]
+  rowData(tr_sce)$gene_name = rowData(tr_sce)$gene_id
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  rownames(cluster_barcode_anno) = cluster_barcode_anno$barcode_seq
+  comm_cells = intersect(colnames(tr_sce),rownames(cluster_barcode_anno))
+  
+  tr_sce = tr_sce[,comm_cells]
+  cluster_barcode_anno = cluster_barcode_anno[comm_cells,]
+  colData(tr_sce) = cbind(colData(tr_sce),DataFrame(cluster_barcode_anno))
+  
+  tr_sce_multi = tr_sce[rowData(tr_sce)$gene_name %in% names( table(rowData(tr_sce)$gene_name)[ table(rowData(tr_sce)$gene_name)>1]), ]
+  
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 4, wt = mean)
+  
+  tr_sce_multi = tr_sce_multi[rowData(tr_sce_multi)$transcript_id %in% row_meta$transcript_id,]
+  tr_sce_multi = logNormCounts(tr_sce_multi)
+  colnames(tr_sce_multi) = paste(colnames(tr_sce_multi),"1",sep="-")
+```
+
+
+```{r}
+tr_sce_multi = tr_sce_multi[,colnames(tr_sce_multi) %in% colnames(scmix2_srt)]
+#colnames(tr_sce_multi) = paste(colnames(tr_sce_multi),"1",sep="-")
+pdf("figs/top_DTU_scmix2.pdf",width = 6,height = 6)
+for (ge_ix in 1:10) {
+  ge = result_mix1$gene_name[ge_ix]
+  ge_name = result_mix1$gene_symbol[ge_ix]
+  tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+  expr = logcounts(tr_sce_multi)[tr_na,]
+  #expr = t(scale(t(expr)))
+  expr = scale(expr)
+  expr[expr<(-2.5)] = -2.5
+  expr[expr>(2.5)] = 2.5
+  gg_l = list()
+  for (ix in 1:(min(4,nrow(expr)))){
+    tr = rownames(expr)[ix]
+    plot_df = data.frame(Dim1=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),1],
+                         Dim2=scmix1_srt@reductions$umap@cell.embeddings[colnames(tr_sce_multi),2],
+                         expression=expr[tr,])
+    gg_l[[ix]] = ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=1)+
+      labs(title=tr)+
+      scale_colour_gradient2(low = "blue", mid = "white",high = "red", na.value = NA)+
+      theme_bw()+
+      theme(text = element_text(size=7))
+  }
+  figure = ggarrange(plotlist = gg_l,common.legend = T,align="hv",legend="right")
+  print(annotate_figure(figure,
+                  top = text_grob(paste(ge,ge_name,sep=" - "))))
+}
+dev.off()
+```
+
+
+```{r}
+snn_mat = as.matrix(scmix2_srt@graphs$SCT_snn)
+
+isoform_gff = import(file.path(data_dir,"FLTSA_output","isoform_annotated.filtered.gff3"))
+isoform_gff$Parent = as.character(isoform_gff$Parent)
+isoform_gff$transcript_id= unlist(lapply(strsplit(isoform_gff$Parent, split = ":"),function(x){x[2]}))
+#isoform_gff$transcript_id = gsub("\\.","", isoform_gff$transcript_id)
+```
+
+## ENSG00000138326 - RPS24
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSG00000138326"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_RPS24_scmix2.pdf",width = 5,height = 4)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(scmix2_srt))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = colnames(scmix2_srt)
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+#tr_rank = tr_na[order(rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"mean"],decreasing = T)]
+tr_rank = c("ENST00000613865.5","ENST00000372360.9","ENST00000360830.9","ENST00000435275.5")
+col_anno = scmix2_srt@meta.data[,"cell_type",drop=FALSE]
+#annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_rownames  = FALSE,show_colnames = FALSE,annotation_col=col_anno,color=BlueAndRed(),filename="figs/heatmap_DTU_RPS24_scmix2.pdf",width = 3,height = 3)
+```
+
+```{r}
+idx=2
+ggplot()+
+      geom_point(aes(x=scmix2_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix2_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix2_RPS24_360.pdf",width = 3,height = 3)
+```
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=scmix2_srt@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=scmix2_srt@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.1,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_scmix2_RPS24_830.pdf",width = 3,height = 3)
+```
+
+# DTU genes in mouse muscle stem cells
+
+```{r}
+srt_msc = readRDS("~/Dropbox/research/sc_longread/manuscript/analysis/data/processed_files/srt_msc.Rds")
+srt_msc = RunUMAP(srt_msc,dims = 1:20)
+DimPlot(srt_msc,label = T)
+```
+
+
+```{r}
+srt_msc$cell_type = "activated"
+srt_msc$cell_type[Idents(srt_msc)==1] = "stem cell"
+```
+
+
+```{r}
+ggplot()+
+      geom_point(aes(x=srt_msc@reductions$umap@cell.embeddings[,1],y=srt_msc@reductions$umap@cell.embeddings[,2],col=srt_msc@assays$RNA@data["CD82",]),alpha=0.8,size=0.7,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression")+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/umap_MuSC_CD82_genelevel.pdf",width = 3,height = 3)
+```
+
+```{r}
+VlnPlot(srt_msc,features="CD82",group.by="cell_type")
+```
+
+
+
+```{r}
+data_dir = "data/PromethION_MuSC"
+  transcript_count <- read.csv(file.path(data_dir,"FLTSA_output","transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"FLTSA_output","isoform_FSM_annotation.csv") , stringsAsFactors=FALSE)
+  transcript_count = transcript_count[match(isoform_FSM_annotation$transcript_id,transcript_count$transcript_id),]
+  transcript_count$FSM_match = isoform_FSM_annotation$FSM_match
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id","FSM_match"))]
+  tr_anno = transcript_count[,c("transcript_id","gene_id","FSM_match")]
+  mer_tmp = transcript_count %>%
+    group_by(FSM_match) %>%
+    summarise_at(cell_bcs,sum)
+  
+  tr_anno = tr_anno[match(mer_tmp$FSM_match,tr_anno$FSM_match),]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp[,-1]) ))
+  rownames(tr_sce) = mer_tmp$FSM_match
+  rowData(tr_sce) = DataFrame(tr_anno)
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  
+  rowData(tr_sce)$gene_id=gsub("\\..*","", rowData(tr_sce)$gene_id)
+  #gene_name = mapIds(org.Hs.eg.db,
+  #                   keys=rowData(tr_sce)$gene_id,
+  #                   column="SYMBOL",
+  #                   keytype="ENSEMBL",
+  #                   multiVals="first")
+  
+  #gene_name[is.na(gene_name)] = rowData(tr_sce)$gene_id[is.na(gene_name)]
+  rowData(tr_sce)$gene_name = rowData(tr_sce)$gene_id
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  rownames(cluster_barcode_anno) = cluster_barcode_anno$barcode_seq
+  comm_cells = intersect(colnames(tr_sce),rownames(cluster_barcode_anno))
+  
+  tr_sce = tr_sce[,comm_cells]
+  cluster_barcode_anno = cluster_barcode_anno[comm_cells,]
+  colData(tr_sce) = cbind(colData(tr_sce),DataFrame(cluster_barcode_anno))
+  
+  tr_sce_multi = tr_sce[rowData(tr_sce)$gene_name %in% names( table(rowData(tr_sce)$gene_name)[ table(rowData(tr_sce)$gene_name)>1]), ]
+  
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 4, wt = mean)
+  
+  tr_sce_multi = tr_sce_multi[rowData(tr_sce_multi)$transcript_id %in% row_meta$transcript_id,]
+  tr_sce_multi = logNormCounts(tr_sce_multi)
+  #colnames(tr_sce_multi) = paste(colnames(tr_sce_multi),"1",sep="-")
+```
+
+```{r}
+tr_sce_multi = tr_sce_multi[,colnames(tr_sce_multi) %in% srt_msc$barcode_seq]
+#colnames(tr_sce_multi) = paste(colnames(tr_sce_multi),"1",sep="-")
+pdf("figs/top_DTU_msc.pdf",width = 6,height = 6)
+for (ge_ix in 1:40) {
+  ge = result_msc$gene_name[ge_ix]
+  ge_name = result_msc$gene_symbol[ge_ix]
+  tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+  expr = logcounts(tr_sce_multi)[tr_na,]
+  #expr = t(scale(t(expr)))
+  expr = scale(expr)
+  expr[expr<(-2.5)] = -2.5
+  expr[expr>(2.5)] = 2.5
+  gg_l = list()
+  for (ix in 1:(min(4,nrow(expr)))){
+    tr = rownames(expr)[ix]
+    plot_df = data.frame(Dim1=srt_msc@reductions$umap@cell.embeddings[match(colnames(tr_sce_multi), srt_msc$barcode_seq),1],
+                         Dim2=srt_msc@reductions$umap@cell.embeddings[match(colnames(tr_sce_multi), srt_msc$barcode_seq),2],
+                         expression=expr[tr,])
+    gg_l[[ix]] = ggplot(data=plot_df)+
+      geom_point(aes(x=Dim1,y=Dim2,col=expression),alpha=0.8,size=1)+
+      labs(title=tr)+
+      scale_colour_gradient2(low = "blue", mid = "white",high = "red", na.value = NA)+
+      theme_bw()+
+      theme(text = element_text(size=7))
+  }
+  figure = ggarrange(plotlist = gg_l,common.legend = T,align="hv",legend="right")
+  print(annotate_figure(figure,
+                  top = text_grob(paste(ge,ge_name,sep=" - "))))
+}
+dev.off()
+```
+
+```{r}
+snn_mat = as.matrix(srt_msc@graphs$RNA_snn)
+
+isoform_gff = import(file.path(data_dir,"FLTSA_output","isoform_annotated.filtered.gff3"))
+isoform_gff$Parent = as.character(isoform_gff$Parent)
+isoform_gff$transcript_id= unlist(lapply(strsplit(isoform_gff$Parent, split = ":"),function(x){x[2]}))
+#isoform_gff$transcript_id = gsub("\\.","", isoform_gff$transcript_id)
+```
+
+# ENSMUSG00000025290 − Rps24
+
+```{r,fig.width=7,fig.height=5}
+ge = "ENSMUSG00000025290"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_RPS24_msc.pdf",width = 5,height = 4)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(srt_msc))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = srt_msc$barcode_seq
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+#tr_rank = tr_na[order(rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"mean"],decreasing = T)]
+tr_rank = c("ENSMUST00000223999.1","ENSMUST00000225023.1","ENSMUST00000169826.2","ENSMUSG00000025290.17_24490718_24495858_2")
+col_anno = srt_msc@meta.data[,c("cell_type"),drop=FALSE]
+#rownames(col_anno) = col_anno$barcode_seq
+#annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_rownames = FALSE,show_colnames = FALSE,annotation_col=col_anno,color=BlueAndRed(),filename="figs/heatmap_DTU_RPS24_msc.pdf",width = 3,height = 3)
+```
+
+```{r}
+idx=1
+ggplot()+
+      geom_point(aes(x=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.7,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"), 
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_MuSC_Rps24_001.pdf",width = 4,height = 4)
+```
+
+
+```{r}
+idx=4
+ggplot()+
+      geom_point(aes(x=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.7,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"), 
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_MuSC_Rps24_023.pdf",width = 4,height = 4)
+```
+
+```{r}
+idx=2
+ggplot()+
+      geom_point(aes(x=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.7,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA)+#,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"), 
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+
+
+```{r}
+
+```
+
+## CD82
+
+```{r,fig.width=5,fig.height=5}
+ge = "ENSMUSG00000027215"
+sel_tr = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"transcript_id"]
+sel_fsm = rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"FSM_match"]
+
+isoform_sel = isoform_gff[isoform_gff$transcript_id %in% sel_tr,]
+isoform_sel <- split(isoform_sel, isoform_sel$transcript_id)
+names(isoform_sel) = sel_fsm[match(names(isoform_sel),sel_tr)]
+g = ggplot(isoform_sel) + 
+  geom_alignment(label = TRUE)+
+  theme_bw()+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                   panel.background = element_blank(), axis.line = element_line(colour = "black"))
+g
+ggsave("figs/isoform_CD82_msc.pdf",width = 4.5,height = 3)
+```
+
+```{r}
+tr_na = rownames( rowData(tr_sce_multi))[rowData(tr_sce_multi)$gene_id==ge]
+expr = logcounts(tr_sce_multi)[tr_na,]
+new_expr = matrix(0,nrow(expr),ncol(srt_msc))
+rownames(new_expr) = rownames(expr)
+colnames(new_expr) = srt_msc$barcode_seq
+new_expr[,colnames(expr)] = expr
+
+new_expr = new_expr %*% snn_mat
+new_expr = t(t(new_expr)/colSums(snn_mat))
+
+
+expr_scale =  scale(new_expr)
+expr_scale = t(apply(expr_scale,1,function(x){x[x<quantile(x,0.05,na.rm=T)]=quantile(x,0.05,na.rm=T) 
+x[x>quantile(x,0.95,na.rm=T)]=quantile(x,0.95,na.rm=T)
+return(x)}))
+
+expr_scale = expr_scale[,!apply(expr_scale,2,function(x){any(is.na(x))})]
+```
+
+```{r}
+tr_rank = tr_na[order(rowData(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,"mean"],decreasing = T)]
+tr_rank = c("ENSMUST00000099696.7","ENSMUST00000028644.10","ENSMUSG00000027215.13_93419111_93462452_3",  "ENSMUSG00000027215.13_93419111_93461912_1" )
+col_anno = srt_msc@meta.data[,c("cell_type"),drop=FALSE]
+#rownames(col_anno) = col_anno$barcode_seq
+#annotation_colors = list(cell_type=c("normal"="brown3","CLL"="cyan3"))
+
+
+hc = hclust(dist(t(expr_scale)))
+
+pheatmap(expr_scale[tr_rank,hc$order],cluster_rows = FALSE,cluster_cols = FALSE,show_rownames = FALSE,show_colnames = FALSE,annotation_col=col_anno,color=BlueAndRed(),
+         filename="figs/heatmap_DTU_CD82_msc.pdf",
+         width = 4,height = 3)
+```
+
+
+
+```{r}
+idx=3
+ggplot()+
+      geom_point(aes(x=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.7,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"), 
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_MuSC_CD82_644.pdf",width = 3,height = 3)
+```
+
+```{r}
+idx=4
+ggplot()+
+      geom_point(aes(x=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),1],y=srt_msc@reductions$umap@cell.embeddings[colnames(expr_scale),2],col=expr_scale[idx,]),alpha=0.8,size=0.7,show.legend = F)+
+      labs(x="Dim1",y="Dim2",col="scaled expression",title = rownames(expr_scale)[idx])+
+      scale_colour_gradient2(low = BlueAndRed()[1], mid = BlueAndRed()[25],high = BlueAndRed()[50], na.value = NA,midpoint=median(expr_scale[idx,]))+
+      theme_bw()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"), 
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+ggsave("figs/UMAP_DTU_MuSC_CD82_696.pdf",width = 3,height = 3)
+```

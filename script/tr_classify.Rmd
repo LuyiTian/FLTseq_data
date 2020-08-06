@@ -1,0 +1,467 @@
+---
+title: "analysis of splicing related to Figure2 and binary splicing analysis"
+output: html_notebook
+---
+
+```{r,warning=FALSE,message=FALSE}
+library(dplyr)
+library(tidyr)
+library(rtracklayer)
+library(ggplot2)
+library(biomaRt)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(ggpubr)
+```
+
+```{r}
+get_strand = function(isoform_gff){
+  isoform_tr = isoform_gff[isoform_gff$type=="gene",]
+  isoform_tr = as.data.frame(isoform_tr)
+  isoform_tr = isoform_tr[,c("gene_id","strand")]
+  return(isoform_tr)
+}
+isoform_gencode = import("/Users/tian.l/data/index/gencode.v33.annotation.gff3.gz")
+tss_encode = get_strand(isoform_gencode)
+tss_encode$gene_id=gsub("\\..*","", tss_encode$gene_id)
+```
+
+```{r}
+sample_list = list("CLL2"="data/PromethION_CLL2/FLAMES_output/",
+                   "scmixology1"="data/PromethION_scmixology1/FLAMES_output/",
+                   "scmixology2"="data/PromethION_scmixology2/FLAMES_output/",
+                   "MuSC"="data/PromethION_MSC/FLAMES_output/")
+sample_list
+sample_names = c('scmixology1',"scmixology2","MuSC","CLL2")
+```
+
+```{r}
+#data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/PromethION_scmixology1"
+
+get_splice_class = function(data_dir){
+  fsm_splice_comp <- read.csv(file.path(data_dir,"fsm_splice_comp.csv"), header=FALSE, stringsAsFactors=FALSE)
+
+  #isoform_gff = import(file.path(data_dir,"FLAMES_output","isoform_annotated.filtered.gff3"))
+  #tss_df = get_tss(isoform_gff)
+  
+  #tss_df = rbind(tss_df, tss_encode)
+  
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"isoform_FSM_annotation.csv"), stringsAsFactors=FALSE)
+  
+  
+  FSM_df = isoform_FSM_annotation %>% group_by(FSM_match) %>% summarise(tot_cnt=sum(total_count))
+  FSM_df_c = FSM_df %>% left_join(isoform_FSM_annotation,by=c("FSM_match"="FSM_match"))
+  FSM_df_c = FSM_df_c[!duplicated(FSM_df_c$FSM_match),]
+  
+  FSM_df_c = FSM_df_c %>% group_by(gene_id ) %>% mutate(cnt_ranks = rank(-tot_cnt,ties.method ="min") ) %>% mutate(percent = tot_cnt/sum(tot_cnt))
+  FSM_df_c = FSM_df_c[FSM_df_c$cnt_ranks<3,]
+  FSM_df_c = FSM_df_c[FSM_df_c$gene_id %in% names(table(FSM_df_c$gene_id))[table(FSM_df_c$gene_id)==2],]
+  FSM_df_c$gene_id=gsub("\\..*","", FSM_df_c$gene_id)
+
+#mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+#test=getBM(attributes = c("hgnc_symbol", "entrezgene"), filters = "hgnc_symbol", values = gene_list, bmHeader = T, mart = mart)
+#colnames(test)=c("hgnc_symbol","ncbi_gene_id")
+    
+  fsm_splice_sel = fsm_splice_comp[fsm_splice_comp$V1 %in% FSM_df_c$FSM_match[FSM_df_c$cnt_ranks==1] & fsm_splice_comp$V2 %in% FSM_df_c$FSM_match[FSM_df_c$cnt_ranks==2],]
+  fsm_splice_sel$gene_id = FSM_df_c$gene_id[match(fsm_splice_sel$V1,FSM_df_c$FSM_match)]
+  fsm_splice_sel$strand = tss_encode$strand[match(fsm_splice_sel$gene_id,tss_encode$gene_id)]
+  fsm_splice_sel$total_cnt = FSM_df_c$tot_cnt[match(fsm_splice_sel$V1,FSM_df_c$FSM_match)]
+  fsm_splice_sel$cnt_pct = FSM_df_c$percent[match(fsm_splice_sel$V1,FSM_df_c$FSM_match)]
+  #fsm_splice_sel$DTU_pval = result_mix1$adj_p[match(fsm_splice_sel$V2,result_mix1$DTU_tr)]
+  
+  fsm_splice_sel$alt_type = "complex_changes"
+  
+  fsm_splice_sel$alt_type[fsm_splice_sel$V3=="incomplete_splice_match"] = "incomplete_splice_match"
+  
+  fsm_splice_sel$alt_type[grepl("diff_one_splice_site",fsm_splice_sel$V3)] = "alt_splice_site"
+  
+  #fsm_splice_sel$alt_type[fsm_splice_sel$V3 %in% c("no_tr_overlap","no_splice_overlap")] = "no_overlap"
+  
+  fsm_splice_sel$alt_type[fsm_splice_sel$V3 =="intron_retention"] = "intron_retention"
+  
+  fsm_splice_sel$alt_type[fsm_splice_sel$V3 =="not_all_splice_match::alt_first_exon::same_last_splice::no_first_exon_overlap" & fsm_splice_sel$strand=="+"] = "alternative_promoters"
+  
+#  fsm_splice_sel$alt_type[fsm_splice_sel$V3 =="not_all_splice_match::alt_first_exon::same_last_splice::no_first_exon_overlap" & fsm_splice_sel$strand=="-"] = "alternative_polyA"
+  
+  fsm_splice_sel$alt_type[fsm_splice_sel$V3 =="not_all_splice_match::alt_last_exon::same_fist_splice::no_last_exon_overlap" & fsm_splice_sel$strand=="-"] = "alternative_promoters"
+  
+#  fsm_splice_sel$alt_type[fsm_splice_sel$V3 #=="not_all_splice_match::diff_one_splice_site::alt_last_exon::same_fist_splice::no_last_exon_overlap" & #fsm_splice_sel$strand=="+"] = "alternative_polyA"
+  
+  fsm_splice_sel$alt_type[fsm_splice_sel$V3 %in% c("not_all_splice_match::same_fist_splice::same_last_splice::exon_inclusion","skip_exon")] = "exon_inclusion_skip"
+  
+  fsm_splice_sel$alt_type[fsm_splice_sel$V3 =="not_all_splice_match::same_fist_splice::same_last_splice::mutually_exclusive_exon"] = "mutually_exclusive_exon"
+  return(fsm_splice_sel)
+}
+
+
+tmp_func = function(smp){
+  res_list[[smp]]$experiment = smp
+  res_list[[smp]]
+}
+
+res_list = lapply(sample_list,get_splice_class)
+
+splice_group_df =  Reduce(rbind,lapply(names(res_list),tmp_func))
+  alt_tab = as.data.frame(table(splice_group_df$alt_type))
+  splice_group_df$alt_type = factor(splice_group_df$alt_type,levels  = alt_tab$Var1[order(alt_tab$Freq)])  
+```
+
+
+```{r}
+# ensembl <- useEnsembl(biomart = "ensembl", 
+#                    dataset = "hsapiens_gene_ensembl")
+# 
+# known_tr_id = c(fsm_splice_sel$V1[grepl("ENST",fsm_splice_sel$V1)],fsm_splice_sel$V2[grepl("ENST",fsm_splice_sel$V2)])
+# known_tr_id=gsub("\\..*","", known_tr_id)
+# known_tr_id = unique(known_tr_id)
+# 
+# res_match = getBM(attributes = c('ensembl_transcript_id', 'transcript_gencode_basic',"transcript_appris","transcript_biotype","ensembl_peptide_id"),
+#       filters = 'ensembl_transcript_id',
+#       values = known_tr_id, 
+#       mart = ensembl)
+# 
+
+```
+
+```{r}
+splice_group_df$experiment <- factor(splice_group_df$experiment,
+                             levels =rev(sample_names),ordered = TRUE)
+```
+
+
+```{r}
+ggplot(data=splice_group_df,aes(alt_type,fill=experiment))+
+  geom_bar(position = "dodge",width = 0.8)+
+  theme_bw()+
+  scale_fill_brewer(palette ="Set2")+
+  coord_flip()+
+  theme(legend.position="top",
+        axis.text.x = element_text(angle = 30, hjust = 1),axis.title = element_blank(),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/comp_splicing_class.pdf",width = 4,height = 5)
+```
+
+
+
+```{r}
+ggplot(data=fsm_splice_sel,aes(x=alt_type,y=cnt_pct))+
+  geom_violin()+
+  theme_bw()
+```
+
+
+```{r}
+ggplot(data=FSM_df_c,aes(x=as.factor(cnt_ranks),y=percent))+
+  geom_violin()+
+  theme_bw()
+```
+
+
+
+
+```{r}
+get_splice_groups = function(data_dir){
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"isoform_FSM_annotation.csv"), stringsAsFactors=FALSE)
+  FSM_df = isoform_FSM_annotation %>% group_by(FSM_match) %>% summarise(tot_cnt=sum(total_count))
+  FSM_df_c = FSM_df %>% left_join(isoform_FSM_annotation,by=c("FSM_match"="FSM_match"))
+  FSM_df_c = FSM_df_c[!duplicated(FSM_df_c$FSM_match),]
+ tr_freq_df = as.data.frame(table(table(FSM_df_c$gene_id)))
+ print(sum(as.numeric(tr_freq_df$Var1)*tr_freq_df$Freq)/sum(tr_freq_df$Freq))
+ print(sum(tr_freq_df$Freq[-1])/sum(tr_freq_df$Freq))
+  tr_freq_df$Var1 = as.numeric(tr_freq_df$Var1)
+  l5 = sum(tr_freq_df$Freq[tr_freq_df$Var1>5])
+  tr_freq_df = tr_freq_df[tr_freq_df$Var1<7,]
+  tr_freq_df$Freq[tr_freq_df$Var1==6] = l5
+  colnames(tr_freq_df) = c("number_of_isoforms","Frequency")
+  return(tr_freq_df)
+}
+
+tmp_func = function(smp){
+  res_list[[smp]]$experiment = smp
+  res_list[[smp]]
+}
+
+res_list = lapply(sample_list,get_splice_groups)
+
+tr_freq =  Reduce(rbind,lapply(names(res_list),tmp_func))
+tr_freq$number_of_isoforms = as.factor(tr_freq$number_of_isoforms)
+levels(tr_freq$number_of_isoforms) <- c(1:5,">5")
+tr_freq$experiment <- factor(tr_freq$experiment,
+                             levels = sample_names,ordered = TRUE)
+ggplot(data=tr_freq,aes(x=number_of_isoforms,y=Frequency,fill=experiment))+
+  geom_bar(stat="identity",alpha=0.9,position="dodge")+
+  scale_fill_brewer(palette ="Set2",direction = -1)+
+  labs(x="number of splice pattern per gene",fill="")+
+  theme_bw()+
+  theme(legend.position="top",
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+ggplot(data=tr_freq,aes(x=number_of_isoforms,y=Frequency))+
+  geom_boxplot()+
+  facet_wrap(~experiment)+
+  theme_bw()
+```
+
+
+```{r}
+get_freq_groups = function(data_dir){
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"isoform_FSM_annotation.csv"), stringsAsFactors=FALSE)
+  gene_cnt = isoform_FSM_annotation %>% group_by(gene_id) %>% summarise(gene_sum = sum(total_count))
+  gene_cnt = gene_cnt[gene_cnt$gene_sum>20,]
+  isoform_FSM_annotation = isoform_FSM_annotation[isoform_FSM_annotation$gene_id %in% isoform_FSM_annotation$gene_id[table(isoform_FSM_annotation$gene_id)>1] & isoform_FSM_annotation$gene_id %in% gene_cnt$gene_id,]
+  FSM_df = isoform_FSM_annotation %>% group_by(FSM_match) %>% summarise(tot_cnt=sum(total_count))
+  FSM_df_c = FSM_df %>% left_join(isoform_FSM_annotation,by=c("FSM_match"="FSM_match"))
+  FSM_df_c = FSM_df_c %>% left_join(gene_cnt,by=c("gene_id"="gene_id"))
+  FSM_df_c = FSM_df_c[!duplicated(FSM_df_c$FSM_match),]
+  FSM_df_c = FSM_df_c %>% group_by(gene_id ) %>% mutate(cnt_ranks = rank(-tot_cnt,ties.method ="min") ) %>% mutate(pct=tot_cnt/sum(tot_cnt))
+  FSM_df_c = FSM_df_c[FSM_df_c$cnt_ranks<10,]
+  FSM_df_c$gene_id=gsub("\\..*","", FSM_df_c$gene_id)
+  q = quantile(FSM_df_c$gene_sum,probs=c(0,0.25,0.75,0.9,1))
+  FSM_df_c$gene_abundance = "<90%"
+  FSM_df_c$gene_abundance[FSM_df_c$gene_sum<q[4]] = "75-90%"
+  FSM_df_c$gene_abundance[FSM_df_c$gene_sum<q[3]] = "25-75%"
+  FSM_df_c$gene_abundance[FSM_df_c$gene_sum<q[2]] = "<25%"
+  FSM_df_c
+}
+
+freq_list = lapply(sample_list,get_freq_groups)
+tmp_func = function(smp){
+  freq_list[[smp]]$experiment = smp
+  freq_list[[smp]]
+}
+
+pct_df =  Reduce(rbind,lapply(names(freq_list),tmp_func))
+pct_df$cnt_ranks = as.factor(pct_df$cnt_ranks )
+pct_df$gene_abundance = factor(pct_df$gene_abundance,levels = c("<25%","25-75%","75-90%","<90%"))
+```
+
+```{r}
+pct_df_tmp = pct_df[pct_df$cnt_ranks %in% c(1,2),]
+pct_df_tmp = pct_df_tmp %>% group_by(gene_id,gene_sum) %>% summarise(sub_pct=sum(pct))
+pct_df_tmp = pct_df_tmp[pct_df_tmp$sub_pct<=1,]
+summary(pct_df_tmp$sub_pct)
+```
+
+
+```{r}
+ggplot(data=pct_df,aes(x=cnt_ranks,y=pct,fill=cnt_ranks))+
+  geom_boxplot(alpha=0.6,show.legend = F)+
+  labs(x="rank of isoforms by abundance",y="isoform abundance / gene abundance")+
+  scale_fill_brewer(palette = "YlGnBu",direction = -1)+
+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave(filename = "figs/isoform_abundance_rank.pdf",width = 5,height = 2.5)
+```
+
+
+```{r,fig.width=5,fig.height=4}
+ggplot(data=pct_df,aes(x=cnt_ranks,y=pct,fill=gene_abundance))+
+  geom_boxplot(alpha=0.8)+
+  labs(x="rank of isoform by abundance",y="isoform abundance / gene abundance",fill="gene expression quantile")+
+  theme_bw()+
+  scale_fill_brewer(palette = "Spectral",direction = -1)+
+  facet_wrap(~experiment,ncol = 2)+
+theme(legend.position = "top",panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave(filename = "figs/sup_sample_isoform_abundance_rank.pdf",width = 5,height = 4)
+```
+# analysis of binary splicing
+
+```{r}
+get_bin_splicing_df = function(data_dir){
+  transcript_count <- read.csv(file.path(data_dir,"FLAMES_output","transcript_count.csv.gz"), stringsAsFactors=FALSE)
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"FLAMES_output","isoform_FSM_annotation.csv") , stringsAsFactors=FALSE)
+  isoform_FSM_annotation = isoform_FSM_annotation[order(isoform_FSM_annotation$total_count,decreasing = T),]
+  transcript_count = transcript_count[match(isoform_FSM_annotation$transcript_id,transcript_count$transcript_id),]
+  transcript_count$FSM_match = isoform_FSM_annotation$FSM_match
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id","FSM_match"))]
+  tr_anno = transcript_count[,c("transcript_id","gene_id","FSM_match")]
+  mer_tmp = transcript_count %>%
+    group_by(FSM_match) %>%
+    summarise_at(cell_bcs,sum)
+  
+  tr_anno = tr_anno[match(mer_tmp$FSM_match,tr_anno$FSM_match),]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp[,-1]) ))
+  rownames(tr_sce) = mer_tmp$FSM_match
+  rowData(tr_sce) = DataFrame(tr_anno)
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  
+  rowData(tr_sce)$gene_id=gsub("\\..*","", rowData(tr_sce)$gene_id)
+  #gene_name = mapIds(org.Hs.eg.db,
+  #                   keys=rowData(tr_sce)$gene_id,
+  #                   column="SYMBOL",
+  #                   keytype="ENSEMBL",
+  #                   multiVals="first")
+  
+  #gene_name[is.na(gene_name)] = rowData(tr_sce)$gene_id[is.na(gene_name)]
+  rowData(tr_sce)$gene_name = rowData(tr_sce)$gene_id
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  rownames(cluster_barcode_anno) = cluster_barcode_anno$barcode_seq
+  comm_cells = intersect(colnames(tr_sce),rownames(cluster_barcode_anno))
+  
+  tr_sce = tr_sce[,comm_cells]
+  cluster_barcode_anno = cluster_barcode_anno[comm_cells,]
+  colData(tr_sce) = cbind(colData(tr_sce),DataFrame(cluster_barcode_anno))
+  
+  tr_sce_multi = tr_sce[rowData(tr_sce)$gene_name %in% names( table(rowData(tr_sce)$gene_name)[ table(rowData(tr_sce)$gene_name)>1]), ]
+  
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 20, wt = mean)
+  
+  tr_sce_multi = tr_sce_multi[rowData(tr_sce_multi)$transcript_id %in% row_meta$transcript_id,]
+  tr_sce_multi = logNormCounts(tr_sce_multi)
+  
+  gene_vec = unique(rowData(tr_sce_multi)$gene_id)
+  ge=gene_vec[1]
+  gene_cnt = c()
+  major_expr_prop = c()
+  mean_prop = c()
+  bin_prop = c()
+  gene_sel = c()
+  bn_logll = c()
+  #ran_bn_logll = c()
+  for (ge in gene_vec) {
+    tmp_cnt = counts(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,]
+    if(sum(tmp_cnt)>10 & !is.null(dim(tmp_cnt)) ){
+      if(sum(colSums(tmp_cnt)>0)<3){
+        next
+      }
+      gene_sel = c(gene_sel, ge)
+      gene_cnt = c(gene_cnt,sum(tmp_cnt))
+      tmp_cnt = tmp_cnt[order(rowSums(tmp_cnt),decreasing = T),]
+      tmp_cnt = tmp_cnt[,colSums(tmp_cnt)>0]
+      major_expr_prop = c(major_expr_prop, sum(tmp_cnt[1,])/sum(tmp_cnt))
+      #ran_cnt = rbinom(ncol(tmp_cnt),colSums(tmp_cnt),major_expr_prop)
+      #ran_pb = dbinom(ran_cnt, colSums(tmp_cnt), major_expr_prop, log = T)
+      pb = dbinom(0, colSums(tmp_cnt), major_expr_prop)+dbinom(colSums(tmp_cnt), colSums(tmp_cnt), major_expr_prop)
+      bn_logll = c(bn_logll,mean(pb))
+      #ran_bn_logll = c(ran_bn_logll, sum(ran_pb))
+      major_prop = tmp_cnt[1,]/colSums(tmp_cnt)
+      mean_prop = c(mean_prop, mean(major_prop))
+      bi = sum(major_prop==1 | major_prop==0)
+      bin_prop = c(bin_prop, bi/ncol(tmp_cnt))
+    }
+  }
+  result_df = data.frame(gene_id=gene_sel,
+                         gene_cnt=log2(gene_cnt),
+                         major_isoform_prop=major_expr_prop,
+                         mean_alt_prop=mean_prop,
+                         prop_binary=bin_prop,
+                         bn_logll=bn_logll,
+                         #ran_bn_logll=ran_bn_logll,
+                         stringsAsFactors = FALSE)
+return(result_df)
+}
+data_dir = "data/PromethION_scmixology1"
+splice_df_scmix1 = get_bin_splicing_df(data_dir)
+data_dir = "data/PromethION_scmixology2"
+splice_df_scmix2 = get_bin_splicing_df(data_dir)
+data_dir = "data/PromethION_MSC"
+splice_df_musc = get_bin_splicing_df(data_dir)
+data_dir = "data/PromethION_CLL2"
+splice_df_cll2 = get_bin_splicing_df(data_dir)
+```
+
+```{r}
+ggplot(data=splice_df_cll2,aes(x=gene_cnt,
+                          y=prop_binary,col=major_isoform_prop))+
+  geom_point(size=0.5,alpha=0.5)+
+  theme_bw()
+ggplot(data=splice_df_cll2,aes(x=gene_cnt,
+                          y=major_isoform_prop,col=prop_binary))+
+  geom_point(size=0.5,alpha=0.5)+
+  theme_bw()
+
+ggplot(data=splice_df_cll2,aes(x=gene_cnt,
+                          y=bn_logll,col=major_isoform_prop))+
+  geom_point(size=0.5,alpha=0.5)+
+  #xlim(-9000,0)+
+  #ylim(-9000,0)+
+  theme_bw()
+```
+
+
+```{r,eval=FALSE}
+get_mean_std = function(result_df){
+  spa = (max(result_df$gene_cnt)-min(result_df$gene_cnt))/7
+  lo = min(result_df$gene_cnt)
+  expr_med = c()
+  bi_mean = c()
+  bi_loci = c()
+  bi_hici = c()
+  for (ix in 1:7){
+    hi = lo+spa
+    res_tmp = result_df[result_df$gene_cnt>lo & result_df$gene_cnt<=hi,]
+    bi_mean = c(bi_mean,mean(res_tmp$bn_logll))
+    bi_loci = c(bi_loci,quantile(res_tmp$bn_logll,0.05))
+    bi_hici = c(bi_hici,quantile(res_tmp$bn_logll,0.95))
+    expr_med = c(expr_med, (lo+hi)/2)
+    lo = hi
+  }
+  nb_df = data.frame(expr_med=expr_med,
+                     bi_mean=bi_mean,
+                     bi_loci=bi_loci,
+                     bi_hici=bi_hici)
+  return(nb_df)
+}
+
+#nb_df = get_mean_std(result_df)
+
+```
+
+```{r}
+blk_thm =         theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),axis.title = element_blank())
+pp1 = ggplot(data=splice_df_scmix1)+
+  geom_point(aes(x=gene_cnt,
+                          y=prop_binary,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  theme_bw()+blk_thm
+pp2 = ggplot(data=splice_df_scmix2)+
+  geom_point(aes(x=gene_cnt,
+                          y=prop_binary,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  theme_bw()+blk_thm
+pp3 = ggplot(data=splice_df_musc)+
+  geom_point(aes(x=gene_cnt,
+                          y=prop_binary,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  theme_bw()+blk_thm
+pp4 = ggplot(data=splice_df_cll2)+
+  geom_point(aes(x=gene_cnt,
+                          y=prop_binary,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  theme_bw()+blk_thm
+ggarrange(pp1,pp2,pp3,pp4,common.legend = T,ncol=4,nrow=1,legend="bottom")
+ggsave("figs/splicing_binary_combined.pdf",width = 8,height = 2.5)
+```
+
+
+```{r}
+table(splice_df_scmix1$prop_binary<0.95 & splice_df_scmix1$prop_binary>0.05)
+table(splice_df_scmix2$prop_binary<0.95 & splice_df_scmix2$prop_binary>0.05)
+table(splice_df_musc$prop_binary<0.95 & splice_df_musc$prop_binary>0.05)
+table(splice_df_cll2$prop_binary<0.95 & splice_df_cll2$prop_binary>0.05)
+```
+
+
+
+
+
+
+

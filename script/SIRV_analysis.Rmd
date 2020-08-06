@@ -1,0 +1,437 @@
+---
+title: "SIRV"
+output: html_notebook
+---
+
+```{r}
+library(readxl)
+library(ggplot2)
+library(tidyverse)
+library(VennDiagram)
+library(ggpubr)
+library(RColorBrewer)
+library(ggsci)
+```
+```{r}
+num_vec = c()
+method_vec = c()
+type_vec = c()
+```
+
+
+load metadata
+
+```{r}
+SIRV_meta <- read_excel("~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/SIRV_Set1_sequence-design-overview-170612a.xlsx", skip = 4)
+SIRV_meta = SIRV_meta[1:100,]
+SIRV_meta = SIRV_meta[!is.na(SIRV_meta$c),]  # keep real transcript
+SIRV_meta_all = SIRV_meta
+SIRV_meta$...6
+```
+
+load FLAMES output
+
+```{r}
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/FLAMES_output_with_junc/"
+#data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/align2transcript/"
+transcript_count <- read.csv(file.path(data_dir, "transcript_count.csv.gz"), stringsAsFactors=FALSE)
+rownames(transcript_count) = transcript_count$transcript_id
+dim(transcript_count)
+```
+
+```{r}
+SIRV_meta$...6[!(SIRV_meta$...6 %in% transcript_count$transcript_id)]
+```
+```{r}
+num_vec = c(num_vec,sum(!(SIRV_meta_all$...6 %in% transcript_count$transcript_id)) )
+method_vec = c(method_vec,"FLAMES")
+type_vec = c(type_vec,"not_in_results")
+
+num_vec = c(num_vec,sum(SIRV_meta_all$...6 %in% transcript_count$transcript_id))
+method_vec = c(method_vec,"FLAMES")
+type_vec = c(type_vec,"in_both")
+
+num_vec = c(num_vec,sum(!(transcript_count$transcript_id %in% SIRV_meta_all$...6)))
+method_vec = c(method_vec,"FLAMES")
+type_vec = c(type_vec,"not_in_ref")
+```
+
+
+```{r}
+myCol <- brewer.pal(3, "Pastel2")
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+venn.diagram(x = list(transcript_count$transcript_id, SIRV_meta$...6),
+             category.names = c("FLAMES output" , "annotation") ,
+             height = 1200, width = 1200, resolution =300, 
+             imagetype = "png",
+             filename="figs/SIRV_overlap_with_junc.png",
+                     lwd = 2,
+        lty = 'blank',
+        fill = myCol[1:2])
+```
+
+
+```{r}
+plot(log2(transcript_count$YFLQYUFTSERFAPKN),log2(transcript_count$QSSRZDSPSKYUXCHP))
+```
+
+
+```{r}
+merge_df = SIRV_meta %>% left_join(transcript_count,by = c("...6" = "transcript_id"))
+merge_df = merge_df[merge_df$`number of exons`>1,]
+merge_df = merge_df[!is.na(merge_df$YFLQYUFTSERFAPKN),]
+merge_df$E2 = as.numeric(merge_df$E2)
+```
+
+
+```{r}
+plot(merge_df$E2,merge_df$YFLQYUFTSERFAPKN,log = "xy")
+```
+
+
+```{r}
+plot(merge_df$E2,merge_df$QSSRZDSPSKYUXCHP,log = "xy")
+```
+
+
+```{r}
+p1 = ggplot(data=merge_df,aes(x=log2(E2),y=log2(YFLQYUFTSERFAPKN)))+
+  geom_point()+
+  geom_smooth(method=lm)+
+  stat_cor(method = "spearman")+
+  labs(x="Expected read abundance",y="Transcript read counts",title=paste0("FLAMES output, n = ",nrow(merge_df)))+
+  #coord_trans(x="log2", y="log2")+
+  theme_bw()
+p1
+```
+
+
+```{r}
+fit = lm(log2(YFLQYUFTSERFAPKN)~log2(E2),data=merge_df)
+summary(fit)
+```
+
+
+
+```{r}
+ggplot(data=merge_df,aes(x=(as.numeric(merge_df$...7)),y=(QSSRZDSPSKYUXCHP)))+
+  geom_point()+
+  geom_smooth(method=lm)+
+  #stat_cor(method = "pearson")+
+  stat_regline_equation()+
+  #coord_trans(x="log2", y="log2")+
+  theme_bw()
+```
+
+
+
+```{r}
+library(rtracklayer)
+library(readxl)
+data_dir="/Users/tian.l/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/FLAMES_output_with_junc"
+isoform_gff = import(file.path(data_dir,"isoform_annotated.gff3"))
+
+uni_tr = unique(isoform_gff$transcript_id[!is.na(isoform_gff$transcript_id)])
+
+
+
+SIRV_meta <- read_excel("~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/SIRV_Set1_sequence-design-overview-170612a.xlsx", skip = 4)
+SIRV_meta = SIRV_meta[1:100,]
+SIRV_meta = SIRV_meta[!is.na(SIRV_meta$c),]  # keep real transcript
+SIRV_meta = SIRV_meta[SIRV_meta$`number of exons`>1,]
+SIRV_meta$...6
+
+
+table(SIRV_meta$...6 %in% uni_tr)
+table(uni_tr %in% SIRV_meta$...6)
+
+uni_tr[!(uni_tr %in% SIRV_meta$...6)]
+
+SIRV_meta$...6[!SIRV_meta$...6 %in% uni_tr]
+
+```
+
+```{r}
+
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/tr_cnt60/"
+transcript_count60 <- read.csv(file.path(data_dir, "transcript_count.csv.gz"), stringsAsFactors=FALSE)
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/tr_cnt70/"
+transcript_count70 <- read.csv(file.path(data_dir, "transcript_count.csv.gz"), stringsAsFactors=FALSE)
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/tr_cnt75/"
+transcript_count75<- read.csv(file.path(data_dir, "transcript_count.csv.gz"), stringsAsFactors=FALSE)
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/tr_cnt80/"
+transcript_count80 <- read.csv(file.path(data_dir, "transcript_count.csv.gz"), stringsAsFactors=FALSE)
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/tr_cnt85/"
+transcript_count85 <- read.csv(file.path(data_dir, "transcript_count.csv.gz"), stringsAsFactors=FALSE)
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/tr_cnt90/"
+transcript_count90 <- read.csv(file.path(data_dir, "transcript_count.csv.gz"), stringsAsFactors=FALSE)
+data_dir = "~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/tr_cnt95/"
+transcript_count95 <- read.csv(file.path(data_dir, "transcript_count.csv.gz"), stringsAsFactors=FALSE)
+```
+
+
+```{r}
+colnames(transcript_count60) = c("transcript_id", "gene_id", "E2_60", "E0_60")
+colnames(transcript_count70) = c("transcript_id", "gene_id", "E2_70", "E0_70")
+colnames(transcript_count75) = c("transcript_id", "gene_id", "E2_75", "E0_75")
+colnames(transcript_count80) = c("transcript_id", "gene_id", "E2_80", "E0_80")
+colnames(transcript_count85) = c("transcript_id", "gene_id", "E2_85", "E0_85")
+colnames(transcript_count90) = c("transcript_id", "gene_id", "E2_90", "E0_90")
+colnames(transcript_count95) = c("transcript_id", "gene_id", "E2_95", "E0_95")
+```
+
+
+```{r}
+merge_df1 = merge_df %>% left_join(transcript_count60,by = c("...6" = "transcript_id"))
+merge_df1 = merge_df1 %>% left_join(transcript_count70,by = c("...6" = "transcript_id"))
+merge_df1 = merge_df1 %>% left_join(transcript_count75,by = c("...6" = "transcript_id"))
+merge_df1 = merge_df1 %>% left_join(transcript_count80,by = c("...6" = "transcript_id"))
+merge_df1 = merge_df1 %>% left_join(transcript_count85,by = c("...6" = "transcript_id"))
+merge_df1 = merge_df1 %>% left_join(transcript_count90,by = c("...6" = "transcript_id"))
+merge_df1 = merge_df1 %>% left_join(transcript_count95,by = c("...6" = "transcript_id"))
+```
+
+
+```{r}
+cnt_m = merge_df1[,c("...6","Summe","E0_60","E0_70","E0_75","E0_80","E0_85","E0_90","E0_95")]
+cnt_m$diff = cnt_m$E0_70-cnt_m$E0_95
+ggplot(data=cnt_m,aes(x=Summe,y=log2(diff+1),col=E0_75))+
+  geom_point()
+```
+
+
+```{r}
+cnt_m = gather(cnt_m, condition, measurement, E0_60:E0_95)
+cnt_m$condition[cnt_m$condition=="E0_60"] = 0.60
+cnt_m$condition[cnt_m$condition=="E0_75"] = 0.75
+cnt_m$condition[cnt_m$condition=="E0_70"] = 0.70
+cnt_m$condition[cnt_m$condition=="E0_80"] = 0.80
+cnt_m$condition[cnt_m$condition=="E0_85"] = 0.85
+cnt_m$condition[cnt_m$condition=="E0_90"] = 0.90
+cnt_m$condition[cnt_m$condition=="E0_95"] = 0.95
+cnt_m$condition = as.numeric(cnt_m$condition)
+```
+
+
+```{r}
+ggplot(data=cnt_m)+
+  geom_line(aes(x=condition,y=measurement,col=`...6`))+
+  coord_trans(y="log2")+
+  theme_bw()
+```
+
+```{r}
+
+len = c()
+coeff0 = c()
+ste1 = c()
+coeff1 = c()
+rs = c()
+med = c()
+for (i in unique(cnt_m$...6)){
+  fit = summary(lm(log2(measurement)~condition,data=cnt_m[cnt_m$...6==i,]))
+  med = c(med, median(unlist(cnt_m[cnt_m$...6==i,"measurement"])))
+  len = c(len, cnt_m[cnt_m$...6==i,][1,"Summe"])
+  coeff0 = c(coeff0, fit$coefficients[1,1])
+  coeff1 = c(coeff1, fit$coefficients[2,1])
+  ste1 = c(ste1, fit$coefficients[2,2])
+  rs = c(rs, fit$r.squared)
+}
+
+fit_df = data.frame(tr_id=unique(cnt_m$...6),
+                    len=unlist(len),
+                    coeff0=coeff0,
+                    ste1=ste1,
+                    coeff1=coeff1,
+                    rs=rs,
+                    med=log2(med),
+                    stringsAsFactors = FALSE)
+```
+
+
+```{r}
+ggplot(data=fit_df,aes(x=len,y=rs,col=coeff1))+
+  geom_point()
+```
+
+
+```{r}
+ggplot(data=fit_df,aes(x=len,y=coeff1,col=rs))+
+  geom_point()
+```
+
+
+```{r}
+sirv_talon_abundance <- read.delim("~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/TALON_output/sirv_talon_abundance.tsv", stringsAsFactors=FALSE)
+sirv_talon_abundance = sirv_talon_abundance[sirv_talon_abundance$SRR6058583>10 & sirv_talon_abundance$SRR6058584>10,]
+head(sirv_talon_abundance)
+```
+
+
+```{r}
+table(sirv_talon_abundance$transcript_novelty)
+```
+
+```{r}
+num_vec = c(num_vec,sum(!(SIRV_meta_all$...6 %in% sirv_talon_abundance$annot_transcript_id)) )
+method_vec = c(method_vec,"TALON")
+type_vec = c(type_vec,"not_in_results")
+
+num_vec = c(num_vec,sum(SIRV_meta_all$...6 %in% sirv_talon_abundance$annot_transcript_id))
+method_vec = c(method_vec,"TALON")
+type_vec = c(type_vec,"in_both")
+
+num_vec = c(num_vec,sum(!(sirv_talon_abundance$annot_transcript_id %in% SIRV_meta_all$...6)))
+method_vec = c(method_vec,"TALON")
+type_vec = c(type_vec,"not_in_ref")
+```
+
+
+```{r}
+merge_df2 = SIRV_meta %>% left_join(sirv_talon_abundance,by = c("...6" = "annot_transcript_id"))
+merge_df2 = merge_df2[merge_df2$`number of exons`>1,]
+merge_df2$E2 = as.numeric(merge_df2$E2)
+```
+
+
+```{r}
+p2 = ggplot(data=merge_df2,aes(x=log2(E2),y=log2(SRR6058583)))+
+  geom_point()+
+  geom_smooth(method=lm)+
+  stat_cor(method = "spearman")+
+  labs(x="Expected read abundance",y="Transcript read counts",title=paste0("TALON output, n = ",sum(!is.na(merge_df2$SRR6058583))))+
+  #coord_trans(x="log2", y="log2")+
+  theme_bw()
+p2
+```
+
+FLAIR output
+
+```{r}
+SRR6058583_count <- read.delim("~/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/FLAIR_output/SRR6058583_count.tsv", stringsAsFactors=FALSE)
+SRR6058583_count$clean_id = sapply(strsplit(SRR6058583_count$ids,split="_"),function(x){x[1]})
+SRR6058583_count$clean_id = sapply(strsplit(SRR6058583_count$clean_id,split="-"),function(x){x[1]})
+SRR6058583_count = SRR6058583_count %>% group_by(clean_id) %>% summarise(sum_cnt=sum(combined_samples_conditionA_batch1))
+SRR6058583_count = SRR6058583_count[SRR6058583_count$sum_cnt>10,]
+
+merge_df3 = SIRV_meta %>% left_join(SRR6058583_count,by = c("...6" = "clean_id"))
+merge_df3 = merge_df3[merge_df3$`number of exons`>1,]
+merge_df3$E2 = as.numeric(merge_df3$E2)
+```
+
+```{r}
+num_vec = c(num_vec,sum(!(SIRV_meta_all$...6 %in% SRR6058583_count$clean_id)) )
+method_vec = c(method_vec,"FLAIR")
+type_vec = c(type_vec,"not_in_results")
+
+num_vec = c(num_vec,sum(SIRV_meta_all$...6 %in% SRR6058583_count$clean_id))
+method_vec = c(method_vec,"FLAIR")
+type_vec = c(type_vec,"in_both")
+
+num_vec = c(num_vec,sum(!(SRR6058583_count$clean_id %in% SIRV_meta_all$...6)))
+method_vec = c(method_vec,"FLAIR")
+type_vec = c(type_vec,"not_in_ref")
+```
+
+
+```{r}
+p3 = ggplot(data=merge_df3,aes(x=log2(E2),y=log2(sum_cnt)))+
+  geom_point()+
+  geom_smooth(method=lm)+
+  stat_cor(method = "spearman")+
+  labs(x="Expected read abundance",y="Transcript read counts",title=paste0("FLAIR output, n = ",sum(!is.na(merge_df3$sum_cnt))))+
+  #coord_trans(x="log2", y="log2")+
+  theme_bw()
+p3
+```
+
+
+```{r,fig.width=9,fig.height=3}
+ggarrange(p1,p2,p3,ncol=3,nrow=1,align="v")
+```
+
+
+```{r}
+stringtie_gtf = import("/Users/tian.l/Dropbox/research/sc_longread/manuscript/analysis/data/bulk/SIRV/stringtie_output/SIRV_stringtie.gtf")
+```
+
+
+```{r}
+unique(stringtie_gtf$reference_id)
+
+table(SIRV_meta$...6 %in% stringtie_gtf$reference_id)
+```
+
+
+```{r}
+string_cnt = stringtie_gtf[!is.na(stringtie_gtf$TPM),]
+string_cnt = string_cnt[!duplicated(string_cnt$reference_id),]
+
+string_cnt = data.frame(reference_id=string_cnt$reference_id,TPM=string_cnt$TPM,stringsAsFactors = FALSE)
+```
+
+```{r}
+num_vec = c(num_vec,sum(!(SIRV_meta_all$...6 %in% string_cnt$reference_id)) )
+method_vec = c(method_vec,"StringTie")
+type_vec = c(type_vec,"not_in_results")
+
+num_vec = c(num_vec,sum(SIRV_meta_all$...6 %in% string_cnt$reference_id))
+method_vec = c(method_vec,"StringTie")
+type_vec = c(type_vec,"in_both")
+
+num_vec = c(num_vec,sum(!(string_cnt$reference_id %in% SIRV_meta_all$...6)))
+method_vec = c(method_vec,"StringTie")
+type_vec = c(type_vec,"not_in_ref")
+```
+
+```{r}
+merge_df4 = SIRV_meta %>% left_join(string_cnt,by = c("...6" = "reference_id"))
+merge_df4 = merge_df4[merge_df4$`number of exons`>1,]
+merge_df4$E2 = as.numeric(merge_df4$E2)
+merge_df4$TPM = as.numeric(merge_df4$TPM)
+```
+
+```{r}
+p4 = ggplot(data=merge_df4,aes(x=log2(E2),y=log2(TPM)))+
+  geom_point()+
+  geom_smooth(method=lm)+
+  stat_cor(method = "spearman")+
+  labs(x="Expected read abundance",y="Transcript read counts",title=paste0("StringTie output, n = ",sum(!is.na(merge_df4$TPM))))+
+  #coord_trans(x="log2", y="log2")+
+  theme_bw()
+p4
+```
+
+
+
+```{r,fig.width=6,fig.height=6}
+ggarrange(p1,p2,p3,p4,ncol=2,nrow=2,align="v")
+ggsave("figs/SIRV_corr_compare.pdf")
+```
+
+```{r}
+library(wesanderson)
+tmp_df = data.frame(num_vec = num_vec,
+                    method_vec = method_vec,
+                    type_vec = type_vec,stringsAsFactors = FALSE)
+tmp_df$type_vec <- factor(tmp_df$type_vec,
+                             levels = c("not_in_ref","in_both","not_in_results"),ordered = TRUE)
+tmp_df$method_vec <- factor(tmp_df$method_vec,
+                             levels = c("FLAMES","TALON","FLAIR","StringTie"),ordered = TRUE)
+
+ggplot(data = tmp_df,aes(x=method_vec,y=num_vec,fill=type_vec))+
+  geom_bar(stat="identity",alpha=0.9)+
+  #scale_fill_manual(values = pal_npg()(5)[c(2,1,3)])+
+  #scale_fill_brewer(palette = "Set2")+
+  #scale_fill_jco()+
+  scale_fill_manual(values = c(wes_palette("GrandBudapest1", n = 3)[1:2],"#64C468"))+
+  labs(y="number of transcript",fill="class")+
+    theme_bw()+
+  theme(legend.position="top",axis.title.x=element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+ggsave("figs/SIRV_comp_to_ref.pdf",width = 4,height = 3)
+```
+
+

@@ -1,0 +1,242 @@
+---
+title: "UMAP visualization of all samples"
+output: html_notebook
+---
+
+
+```{r,warning=FALSE,message=FALSE}
+library(ggplot2)
+library(Seurat)
+library(scater)
+library(scran)
+library(DropletUtils)
+library(batchelor)
+```
+
+sc_mixology dataset rep1 (using 10X v2 chemistry)
+
+scmixology1
+
+```{r}
+Lib_10 <- read.csv("data/PromethION_5cl_rep1/scpipe_output/Lib10.1000.csv", row.names=1, stringsAsFactors=FALSE)
+
+load("~/git/CellBench_data/data/sincell_with_class_5cl.RData")
+sce_sr = sce_sc_10x_5cl_qc
+Lib_all<- read.csv("data/PromethION_5cl_rep1/scpipe_output/Lib90.csv", row.names=1, stringsAsFactors=FALSE)
+sce_sr = sce_sr[,colnames(sce_sr) %in% rownames(Lib_all)]
+sce_sr$barcode_seq = Lib_all[colnames(sce_sr),"barcode_sequence"]
+colnames(sce_sr) = sce_sr$barcode_seq 
+
+sce_sr$batch ="short"
+sce_sr$batch[colnames(sce_sr) %in% Lib_10$barcode_sequence] = "short + long"
+```
+
+```{r}
+srt1 = CreateSeuratObject(counts(sce_sr),project="rep1")
+srt1$batch = sce_sr$batch
+srt1$cell_type = sce_sr$cell_line_demuxlet
+srt1 = SCTransform(srt1,variable.features.n = 1000)
+saveRDS(srt1,file="data/processed_files/scmix1_srt.Rds")
+```
+
+
+
+sc_mixology dataset rep2 (using 10X v3 chemistry)
+
+```{r}
+sce2 <- read10xCounts("data/cellranger_output/scmixology_rep2/filtered_feature_bc_matrix_all")
+sc_10x_cr_v3 <- read.delim("data/cellranger_output/scmixology_rep2/sc_10x_cr_v3.best", stringsAsFactors=FALSE)
+sc_10x_cr_v3 = sc_10x_cr_v3[grepl("SNG",sc_10x_cr_v3$BEST),]
+sce2$cell_type = sc_10x_cr_v3$BEST[match(sce2$Barcode,sc_10x_cr_v3$BARCODE)]
+sce2$cell_type = sapply(strsplit(sce2$cell_type,"-"),function(x){x[2]})
+sce2$cell_type[sce2$cell_type=="H8383"] = "H838"
+sce2 = sce2[,sce2$Barcode %in% sc_10x_cr_v3$BARCODE]
+sce2_qc = perCellQCMetrics(sce2)
+sce2 = sce2[,sce2_qc$sum>10000]
+```
+
+```{r}
+rn <- uniquifyFeatureNames(
+    rowData(sce2)$ID, rowData(sce2)$Symbol)
+rownames(sce2) = rn
+```
+
+
+
+
+
+
+
+
+```{r}
+sce2_lib10 <- read10xCounts("data/cellranger_output/scmixology_rep2/filtered_feature_bc_matrix10")
+sce2$batch ="short"
+sce2$batch[sce2$Barcode %in% sce2_lib10$Barcode] = "short + long"
+colnames(sce2) = sce2$Barcode
+```
+
+
+```{r}
+srt2 = CreateSeuratObject(counts(sce2),project="rep2")
+srt2$batch = sce2$batch
+srt2$cell_type = sce2$cell_type
+srt2 = SCTransform(srt2,variable.features.n = 1000,verbose = FALSE)
+saveRDS(srt2,file="data/processed_files/scmix2_srt.Rds")
+```
+
+
+
+```{r}
+options(future.globals.maxSize = 4000 * 1024^2)
+pancreas.features <- SelectIntegrationFeatures(object.list = list(srt1,srt2), nfeatures = 1000)
+pancreas.list <- PrepSCTIntegration(object.list = list(srt1,srt2), anchor.features = pancreas.features, 
+    verbose = FALSE)
+pancreas.anchors <- FindIntegrationAnchors(object.list = pancreas.list, normalization.method = "SCT", 
+    anchor.features = pancreas.features, verbose = FALSE)
+srt.integrated <- IntegrateData(anchorset = pancreas.anchors, normalization.method = "SCT", 
+    verbose = FALSE)
+```
+
+```{r}
+srt.integrated <- RunPCA(srt.integrated, verbose = FALSE)
+srt.integrated <- RunUMAP(srt.integrated, dims = 1:10)
+```
+
+
+```{r}
+DimPlot(srt.integrated)
+```
+
+
+```{r}
+plot_df = data.frame(Dim1=srt.integrated@reductions$umap@cell.embeddings[,1],
+                     Dim2=srt.integrated@reductions$umap@cell.embeddings[,2],
+                     batch=srt.integrated$orig.ident,
+                     data_type=srt.integrated$batch,
+                     stringsAsFactors = FALSE)
+
+plot_df = plot_df %>% arrange(data_type)
+
+p1 = ggplot(data=plot_df,aes(x=Dim1, y=Dim2,col=data_type))+
+  geom_point(size=0.5,alpha=0.6)+
+  labs(x="Dim1",y="Dim2",col="data type")+
+  scale_color_manual(values = c("grey80","red"))+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+p1
+ggsave("figs/umap_scmixology_col_by_type.pdf",width = 4.6,height = 3.5)
+```
+
+```{r}
+p11 = DimPlot(srt.integrated,group.by = "cell_type",label=T)
+p11 
+```
+
+
+
+```{r}
+srt_msc = readRDS("data/processed_files/srt_msc.Rds")
+srt_msc = RunUMAP(srt_msc,dims = 1:20)
+p21 = DimPlot(srt_msc,label = T)
+p21 
+```
+
+```{r}
+Lib_all<- read.csv("data/PromethION_MSC/scpipe_output/Lib_all/MuSC_Lib90.csv", stringsAsFactors=FALSE)
+Lib_all = Lib_all[Lib_all$cell_name %in% colnames(srt_msc),]
+colnames(Lib_all) = c("cell_name_all"    ,    "barcode_sequence" ,"count"         )
+Lib_10 <- read.csv("data/PromethION_MSC/scpipe_output/MuSC_Lib10_top1k.csv", stringsAsFactors=FALSE)
+Lib_all = Lib_all %>% left_join(Lib_10,by=c("barcode_sequence"="barcode_sequence"))
+Lib_all$batch = "short + long" 
+Lib_all$batch[is.na(Lib_all$cell_name)] = "short"
+```
+
+
+```{r}
+plot_df_msc = data.frame(Dim1=srt_msc@reductions$umap@cell.embeddings[,1],
+                     Dim2=srt_msc@reductions$umap@cell.embeddings[,2],
+                     batch=srt_msc$orig.ident,
+                     data_type=Lib_all$batch,
+                     stringsAsFactors = FALSE)
+
+plot_df_msc = plot_df_msc %>% arrange(data_type)
+
+p2 = ggplot(data=plot_df_msc,aes(x=Dim1, y=Dim2,col=data_type))+
+  geom_point(size=0.5,alpha=0.6)+
+  labs(x="Dim1",y="Dim2",col="data type")+
+  scale_color_manual(values = c("grey80","red"))+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+p2
+ggsave("figs/umap_MSC_col_by_type.pdf",width = 4.6,height = 3.5)
+```
+
+```{r}
+rm(srt.integrated)
+rm(srt1)
+rm(srt2)
+rm(rescaled)
+rm(pancreas.anchors)
+rm(pancreas.list)
+```
+
+```{r}
+srt <- readRDS("~/Dropbox/research/sc_longread/Rachel/short_reads/CLL141_lib20_srt.Rds")
+DimPlot(srt,group.by = "batch")
+```
+
+```{r}
+p31 = DimPlot(srt,label=T)
+p31
+```
+
+
+```{r}
+plot_df_cll1 = data.frame(Dim1=srt@reductions$umap@cell.embeddings[,1],
+                     Dim2=srt@reductions$umap@cell.embeddings[,2],
+                     batch=srt$orig.ident,
+                     data_type=srt$batch,
+                     stringsAsFactors = FALSE)
+plot_df_cll1$data_type[plot_df_cll1$data_type=="Lib20"] = "short + long" 
+plot_df_cll1$data_type[plot_df_cll1$data_type=="Lib80"] = "short" 
+plot_df_cll1 = plot_df_cll1 %>% arrange(data_type)
+
+p3 = ggplot(data=plot_df_cll1,aes(x=Dim1, y=Dim2,col=data_type))+
+  geom_point(size=0.5,alpha=0.6)+
+  labs(x="Dim1",y="Dim2",col="data type")+
+  scale_color_manual(values = c("grey80","red"))+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"),
+axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+p3
+ggsave("figs/umap_CLL1_col_by_type.pdf",width = 4.6,height = 3.5)
+```
+
+
+```{r}
+ggarrange(p1,p2,p3,ncol=3,nrow=1,common.legend = TRUE)
+ggsave("figs/umap_combined_col_by_type.pdf",width = 7,height = 2.5)
+```
+
+
+```{r}
+pdf("figs/umap_combiend_clusters.pdf",width = 7,height = 7)
+ggarrange(p11,p21,p31,legend = "top")
+dev.off()
+```
+
+

@@ -1,0 +1,628 @@
+---
+title: "compare gff files from different samples"
+output: html_notebook
+---
+```{r}
+library(tidyr)
+library(dplyr)
+library(UpSetR)
+library(ggplot2)
+library(scater)
+library(scran)
+library(DropletUtils)
+blk_thm =         theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), panel.border = element_blank(),axis.line = element_line(colour = "black"))
+```
+
+
+```{r}
+
+combined <- read.delim("data/compare_gff/combined.tracking", header=FALSE, stringsAsFactors=FALSE)
+```
+
+['scmixology2', 'CLL153', 'CLL141', 'CLL267', 'scmixology1', 'CLL318', 'CLL152']
+
+```{r}
+TF_tr = apply(combined[5:11],2,function(x){x!="-"})*1
+colnames(TF_tr) = c('scmixology2', 'CLL153', 'CLL141', 'CLL267', 'scmixology1', 'CLL318', 'CLL152')
+TF_tr=TF_tr[,c('scmixology2', 'scmixology1','CLL141', 'CLL267', 'CLL152','CLL153','CLL318')]
+TF_tr = as.data.frame(TF_tr)
+TF_tr$tr_id = combined$V1
+```
+
+percentage overlap between biological replicates.
+```{r}
+nrow(TF_tr[TF_tr$scmixology2==1 & TF_tr$scmixology1==1,])/nrow(TF_tr[TF_tr$scmixology1==1,])
+nrow(TF_tr[TF_tr$scmixology2==1 & TF_tr$scmixology1==1,])/nrow(TF_tr[TF_tr$scmixology2==1,])
+```
+
+```{r}
+sum(TF_tr$scmixology2==0 & TF_tr$scmixology1==1 & TF_tr$CLL141==0)/sum(TF_tr$scmixology1==1)
+sum(TF_tr$scmixology2==1 & TF_tr$scmixology1==0 & TF_tr$CLL141==0)/sum(TF_tr$scmixology2==1)
+sum(TF_tr$scmixology2==0 & TF_tr$scmixology1==0 & TF_tr$CLL141==1)/sum(TF_tr$CLL141==1)
+```
+
+
+```{r}
+ combined.combined_classification <- read.delim("data/compare_gff/SQANTI2/combined.combined_classification.txt")
+head(combined.combined_classification)
+```
+
+```{r}
+table(combined.combined_classification$structural_category,combined$V4)
+```
+
+```{r}
+table(combined.combined_classification$structural_category[TF_tr$scmixology2==1 & TF_tr$scmixology1==1])
+```
+
+percentage of novel transcript shared between biological replicates
+```{r}
+1-18666/sum(TF_tr$scmixology2==1 & TF_tr$scmixology1==1)
+```
+
+
+```{r}
+combined.combined_classification_sel = combined.combined_classification[,c("isoform","structural_category","subcategory","all_canonical","within_cage_peak")]
+
+TF_tr_integrated = TF_tr %>% left_join(combined.combined_classification_sel,by=c("tr_id"="isoform"))
+```
+
+```{r}
+TF_tr_integrated = TF_tr_integrated[,!(colnames(TF_tr_integrated) %in% c("CLL267","CLL152","CLL153","CLL318"))]
+```
+
+
+```{r,eval=FALSE}
+pdf("figs/upset_plot_gffcomp.pdf",width = 4,height = 3)
+ upset(TF_tr_integrated,nsets = 10,order.by = "freq",nintersects=top_n_sel,keep.order=TRUE,sets=c('scmixology1', 'scmixology2','CLL141'),
+mainbar.y.label="")
+dev.off()
+```
+
+
+```{r}
+table(TF_tr_integrated[TF_tr_integrated$CLL141==1 & TF_tr_integrated$CLL267==0 & TF_tr_integrated$CLL152==0 & TF_tr_integrated$CLL318==0 & TF_tr_integrated$scmixology2==0 & TF_tr_integrated$scmixology1==0,"structural_category"])
+```
+
+
+```{r}
+TF_tr_integrated$set_cat = apply(TF_tr_integrated[,c('scmixology2', 'scmixology1','CLL141')],1,function(x){paste(x,collapse="_")})
+
+top_int_kept = names(table(TF_tr_integrated$set_cat)[order(table(TF_tr_integrated$set_cat),decreasing = T)])
+TF_tr_integrated_sel = TF_tr_integrated[TF_tr_integrated$set_cat %in% top_int_kept,]
+TF_tr_integrated_sel = TF_tr_integrated_sel[!(TF_tr_integrated_sel$set_cat=="0_0_0"),]
+TF_tr_integrated_sel$set_cat = factor(TF_tr_integrated_sel$set_cat,levels = top_int_kept)
+TF_tr_integrated_sel = TF_tr_integrated_sel[TF_tr_integrated_sel$structural_category %in% c("full-splice_match","incomplete-splice_match","novel_in_catalog","novel_not_in_catalog"),]
+```
+
+
+```{r}
+ggplot(data=TF_tr_integrated_sel,aes(x=set_cat,fill=structural_category))+
+  geom_bar()+
+  labs(y="number of transcripts",fill="")+
+  scale_fill_manual(values =  c("#ED4E31","#FFC000","#70AD7A","#6C72C4"))+
+  theme_bw()+
+  theme(legend.position="top",axis.title.x=element_blank(),
+        axis.text.x = element_blank(),legend.text=element_text(size=7),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank())
+#ggsave("figs/intersect_cat_barplot.pdf",width = 4,height = 3)
+```
+
+
+```{r}
+ggplot(data=TF_tr_integrated_sel,aes(x=set_cat,fill=subcategory))+
+  geom_bar()+
+  labs(y="number of transcripts",fill="")+
+  theme_bw()+
+  theme(legend.position="top",axis.title.x=element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank())
+```
+
+```{r}
+ggplot(data=TF_tr_integrated_sel,aes(x=set_cat,fill=all_canonical))+
+  geom_bar()+
+  labs(y="number of transcripts",fill="")+
+  theme_bw()+
+  theme(legend.position="top",axis.title.x=element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank())
+```
+
+
+```{r}
+ggplot(data=TF_tr_integrated_sel,aes(x=set_cat,fill=within_cage_peak))+
+  geom_bar()+
+  labs(y="number of transcripts",fill="")+
+  theme_bw()+
+  theme(legend.position="top",axis.title.x=element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank())
+```
+
+## downsampling analysis
+
+['scmixology2_0.8', 'scmixology2_0.2', 'scmixology2_0.6', 'scmixology2_0.4', 'scmixology2']
+
+```{r}
+
+downsmp_mix2 <- read.delim("data/compare_gff/downsample_scmix2.tracking", header=FALSE, stringsAsFactors=FALSE)
+
+TF_tr = apply(downsmp_mix2[5:9],2,function(x){x!="-"})*1
+colnames(TF_tr) = c('scmixology2_0.8', 'scmixology2_0.2', 'scmixology2_0.6', 'scmixology2_0.4', 'scmixology2')
+TF_tr=TF_tr[,c('scmixology2_0.2', 'scmixology2_0.4','scmixology2_0.6', 'scmixology2_0.8', 'scmixology2')]
+TF_tr = as.data.frame(TF_tr)
+TF_tr$tr_id = downsmp_mix2$V1
+```
+
+```{r}
+TF_tr_typ = TF_tr
+TF_tr_typ$code = downsmp_mix2$V4
+kn = TF_tr_typ$code=="="
+TF_tr_typ$code[kn] = "known"
+TF_tr_typ$code[!kn] = "novel"
+TF_tr_typ = TF_tr_typ %>% gather(smp,val,1:5)
+TF_tr_typ = TF_tr_typ %>% group_by(smp,code) %>% summarise(sum_val=sum(val))
+TF_tr_typ$code = factor(TF_tr_typ$code,levels = c("novel","known"))
+TF_tr_typ$smp = factor(TF_tr_typ$smp,levels = c("scmixology2_0.2","scmixology2_0.4","scmixology2_0.6","scmixology2_0.8","scmixology2"))
+ggplot(data=TF_tr_typ,aes(x=smp,y=sum_val,fill=code))+
+  geom_bar(alpha=0.8,stat="identity")+coord_flip()+
+  scale_fill_manual(values = c("cadetblue3","darkred"))+
+  labs(x="",y="number of transcripts",fill="transcript status")+
+  theme_bw()+blk_thm+theme(legend.position = "top")
+ggsave("figs/downsampling_scmix2_numtr.pdf",width = 3.8,height = 2.5)
+```
+
+
+```{r}
+ upset(TF_tr,nsets = 10,order.by = "freq",nintersects=15,keep.order=TRUE,sets=c('scmixology2_0.2', 'scmixology2_0.4','scmixology2_0.6', 'scmixology2_0.8', 'scmixology2'),
+mainbar.y.label="")
+
+pdf("figs/upset_plot_downsample_scmix2_tr_cnt.pdf",width = 5,height = 3)
+ upset(TF_tr,nsets = 10,order.by = "freq",nintersects=15,keep.order=TRUE,sets=c('scmixology2_0.2', 'scmixology2_0.4','scmixology2_0.6', 'scmixology2_0.8', 'scmixology2'),
+mainbar.y.label="number of isoforms")
+dev.off()
+```
+
+['scmixology1_0.2', 'scmixology1_0.4', 'scmixology1_0.6', 'scmixology1_0.8', 'scmixology1']
+
+
+```{r}
+
+downsmp_mix1 <- read.delim("data/compare_gff/downsample_scmix1.tracking", header=FALSE, stringsAsFactors=FALSE)
+
+TF_tr = apply(downsmp_mix1[5:9],2,function(x){x!="-"})*1
+colnames(TF_tr) = c('scmixology1_0.2', 'scmixology1_0.4', 'scmixology1_0.6', 'scmixology1_0.8', 'scmixology1')
+TF_tr=TF_tr[,c('scmixology1_0.2', 'scmixology1_0.4','scmixology1_0.6', 'scmixology1_0.8', 'scmixology1')]
+TF_tr = as.data.frame(TF_tr)
+TF_tr$tr_id = downsmp_mix1$V1
+```
+
+```{r}
+ upset(TF_tr,nsets = 10,order.by = "freq",nintersects=15,keep.order=TRUE,sets=c('scmixology1_0.2', 'scmixology1_0.4','scmixology1_0.6', 'scmixology1_0.8', 'scmixology1'),
+mainbar.y.label="")
+```
+
+
+```{r}
+cal_gene_corr = function(sce1,sce2){
+  sapply(1:ncol(sce1),function(i){cor(counts(sce1)[,i],counts(sce2)[,i])})
+}
+
+get_corr_SvsL=function(data_dir, tr_cnt_file, experiment){
+  transcript_count <- read.csv(tr_cnt_file, stringsAsFactors=FALSE)
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id"))]
+  mer_tmp = transcript_count %>%
+    group_by(gene_id) %>%
+    summarise_at(cell_bcs,sum)
+  
+  mer_tmp$gene_id=gsub("\\..*","", mer_tmp$gene_id)
+  mer_tmp = as.data.frame(mer_tmp)
+  mer_tmp = mer_tmp[!duplicated(mer_tmp$gene_id),]
+  rownames(mer_tmp) = mer_tmp$gene_id
+  mer_tmp=mer_tmp[,-1]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp)))
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  fname=file.path(data_dir,"filtered_feature_bc_matrix")
+  sce <- read10xCounts(fname, col.names=TRUE)
+  colnames(sce) = sapply(strsplit(colnames(sce),"-"),function(x){x[1]})
+  sce = addPerCellQC(sce)
+  keep.low <- isOutlier(sce$sum, type="lower", log=TRUE)
+  sce = sce[,(!keep.low)]
+  
+  comm_cells = intersect(colnames(sce),colnames(tr_sce))
+  comm_genes = intersect(rownames(sce),rownames(tr_sce))
+  tr_sce = tr_sce[comm_genes,comm_cells]
+  sce = sce[comm_genes,comm_cells]
+  fit = lm(tr_sce$sum~sce$sum)
+  cooksd <- cooks.distance(fit)
+  outlier.rm = cooksd>5*mean(cooksd, na.rm=T)
+  sce = sce[,!outlier.rm]
+  tr_sce = tr_sce[,!outlier.rm]
+  gene_corr = cal_gene_corr(sce, tr_sce)
+  res_df = data.frame(cell_cor=gene_corr, short_sum=sce$sum,long_sum=tr_sce$sum,experiment=rep(experiment,length(gene_corr)),stringsAsFactors = FALSE)
+  res_df = res_df[res_df$cell_cor>0.5,]
+  return(res_df)
+}
+```
+
+```{r}
+data_dir = "data/PromethION_scmixology2"
+res_mix2 = get_corr_SvsL(data_dir, file.path(data_dir,"FLTSA_output","transcript_count.csv.gz"),"scmixology2")
+
+res_mix2_8 = get_corr_SvsL(data_dir, file.path(data_dir,"FLTSA_output","downsample","transcript_count_0.8.csv.gz"),"scmixology2_0.8")
+
+res_mix2_6 = get_corr_SvsL(data_dir, file.path(data_dir,"FLTSA_output","downsample","transcript_count_0.6.csv.gz"),"scmixology2_0.6")
+res_mix2_4 = get_corr_SvsL(data_dir, file.path(data_dir,"FLTSA_output","downsample","transcript_count_0.4.csv.gz"),"scmixology2_0.4")
+res_mix2_2 = get_corr_SvsL(data_dir, file.path(data_dir,"FLTSA_output","downsample","transcript_count_0.2.csv.gz"),"scmixology2_0.2")
+res_combined = rbind(res_mix2_2,res_mix2_4,res_mix2_6,res_mix2_8,res_mix2)
+res_combined$downsampling_ratio = 0.2
+res_combined$downsampling_ratio[res_combined$experiment=="scmixology2_0.4"] = 0.4
+res_combined$downsampling_ratio[res_combined$experiment=="scmixology2_0.6"] = 0.6
+res_combined$downsampling_ratio[res_combined$experiment=="scmixology2_0.8"] = 0.8
+res_combined$downsampling_ratio[res_combined$experiment=="scmixology2"] = 1
+res_combined$downsampling_ratio = as.factor(res_combined$downsampling_ratio)
+res_combined$experiment = factor(res_combined$experiment,levels = c("scmixology2_0.2","scmixology2_0.4","scmixology2_0.6","scmixology2_0.8","scmixology2"))
+```
+
+```{r}
+ggplot(data=res_combined,aes(x=experiment,y=cell_cor,fill=downsampling_ratio))+
+  geom_violin(show.legend = T,alpha=0.8)+
+  labs(x="scmixology2",y="Pearson correlation")+
+     stat_summary(
+     fun.data = function(x){data.frame(y=max(x)+0.03, label=paste0('',  round(mean(x), 2) ))}, 
+     geom = "text", 
+     hjust = 0.5,
+     vjust = 0.9,
+     show.legend = FALSE,
+     angle = 30
+   )+
+  scale_fill_brewer(palette ="PuBuGn")+
+  theme_bw()+
+  theme(axis.text.x.bottom =element_blank(),panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),panel.border = element_blank(),axis.line = element_line(colour = "black"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+ggsave("figs/cc_corr_downsample_scmix2.pdf",width = 4,height = 2.5)
+```
+
+
+```{r}
+filter_gene = function(sce,min_cell=10){
+  if (0.01*ncol(sce)>min_cell){
+    min_cell = 0.01*ncol(sce)
+  }
+  keep1 = (apply(counts(sce), 1, function(x) mean(x[x>0])) > 1)  # average count 
+  keep2 = (rowSums(counts(sce)>0) >min_cell )
+  sce = sce[(keep1 & keep2), ]
+  return(sce)
+}
+
+DTU_analysis = function(data_dir,tr_cnt_file,fsm_annotation){
+  transcript_count <- read.csv(tr_cnt_file, stringsAsFactors=FALSE)
+  isoform_FSM_annotation <- read.csv(fsm_annotation , stringsAsFactors=FALSE)
+  transcript_count = transcript_count[match(isoform_FSM_annotation$transcript_id,transcript_count$transcript_id),]
+  transcript_count$FSM_match = isoform_FSM_annotation$FSM_match
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id","FSM_match"))]
+  tr_anno = transcript_count[,c("transcript_id","gene_id","FSM_match")]
+  mer_tmp = transcript_count %>%
+    group_by(FSM_match) %>%
+    summarise_at(cell_bcs,sum)
+  
+  tr_anno = tr_anno[match(mer_tmp$FSM_match,tr_anno$FSM_match),]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp[,-1]) ))
+  rownames(tr_sce) = mer_tmp$FSM_match
+  rowData(tr_sce) = DataFrame(tr_anno)
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  
+  rowData(tr_sce)$gene_id=gsub("\\..*","", rowData(tr_sce)$gene_id)
+  #gene_name = mapIds(org.Hs.eg.db,
+  #                   keys=rowData(tr_sce)$gene_id,
+  #                   column="SYMBOL",
+  #                   keytype="ENSEMBL",
+  #                   multiVals="first")
+  
+  #gene_name[is.na(gene_name)] = rowData(tr_sce)$gene_id[is.na(gene_name)]
+  rowData(tr_sce)$gene_name = rowData(tr_sce)$gene_id
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  rownames(cluster_barcode_anno) = cluster_barcode_anno$barcode_seq
+  comm_cells = intersect(colnames(tr_sce),rownames(cluster_barcode_anno))
+  
+  tr_sce = tr_sce[,comm_cells]
+  cluster_barcode_anno = cluster_barcode_anno[comm_cells,]
+  colData(tr_sce) = cbind(colData(tr_sce),DataFrame(cluster_barcode_anno))
+  
+  tr_sce_multi = tr_sce[rowData(tr_sce)$gene_name %in% names( table(rowData(tr_sce)$gene_name)[ table(rowData(tr_sce)$gene_name)>1]), ]
+  
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 4, wt = mean)
+  
+  tr_sce_multi = tr_sce_multi[rowData(tr_sce_multi)$transcript_id %in% row_meta$transcript_id,]
+
+  tmp_df = as.data.frame(counts(tr_sce_multi))
+  tmp_df$tr_id = rownames(tmp_df)
+  tr_sce_multi$barcode_seq = colnames(tr_sce_multi)
+  data_long <- gather(tmp_df, cell_id, cnt,colnames(tmp_df)[!(colnames(tmp_df)=="tr_id")])
+  tr_sce_multi$groups = as.factor(tr_sce_multi$groups)
+  data_long = left_join(data_long, as.data.frame(colData(tr_sce_multi)[,c("barcode_seq","groups")]),by=c("cell_id"="barcode_seq"))
+  data_long = data_long %>% group_by(tr_id, groups) %>% summarise(cnt=sum(cnt))
+  data_wide <- data_long %>% pivot_wider(id_cols=tr_id, names_from=groups,values_from=cnt)
+  all_grp = colnames(data_wide)[-1]
+  #data_wide = as.matrix(data_wide[,-1])
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% left_join(data_wide,by=c("FSM_match"="tr_id"))
+  get_rm = function(x){
+    tmp = row_meta
+    tmp$l = tmp[,x]
+    gc = tmp %>% group_by(gene_name) %>% dplyr::summarise(l_s=max(l))
+    tmp = tmp[tmp$gene_name %in% gc$gene_name[gc$l_s>10],]
+    tmp = tmp %>% group_by(gene_name) %>% top_n(n = 2)
+    return(tmp$transcript_id)
+  }
+  sel_tr = Reduce(union,lapply(all_grp,get_rm))
+  row_meta = row_meta[row_meta$transcript_id %in% sel_tr,]
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 4, wt = mean)
+  
+  ge_name = c()
+  X_value = c()
+  df = c()
+  p_value = c()
+  DTU_tr = c()
+  DTU_group = c()
+  for (ge in unique(row_meta$gene_name)){
+  #for (ge in sel_ge){
+    data_wide_tmp = data_wide[rowData(tr_sce_multi)$gene_name==ge,]
+    data_wide_tmp = data_wide_tmp[data_wide_tmp$tr_id %in% row_meta$FSM_match,]
+    rn = data_wide_tmp$tr_id
+    data_wide_tmp = as.matrix(data_wide_tmp[,-1])
+    rownames(data_wide_tmp) = rn
+    data_wide_tmp = data_wide_tmp[apply(data_wide_tmp,1,max)>15,apply(data_wide_tmp,2,max)>15]
+      if (!is.null(dim(data_wide_tmp))){
+          if(ncol(data_wide_tmp)>2 & nrow(data_wide_tmp)>1){
+            fit = chisq.test(data_wide_tmp)
+            ge_name = c(ge_name,ge)
+            X_value = c(X_value,fit$statistic)
+            df = c(df,fit$parameter)
+            p_value = c(p_value,fit$p.value)
+            cs = colSums( fit$residuals^2 )
+            DTU_group = c(DTU_group, names(cs[order(cs,decreasing = T)[1]]) )
+            if(nrow(data_wide_tmp)==2){
+              rs = rowSums(data_wide_tmp)
+              DTU_tr = c(DTU_tr,names(rs[order(rs)[1]]) )
+            }else{
+              hi1 = which(rowSums(data_wide_tmp)== max(rowSums(data_wide_tmp)))
+              if (length(hi1)>1){
+                re1 = rowSums(fit$residuals[hi1,]^2)
+              }else{
+                re1 = rowSums(fit$residuals[-hi1,]^2)
+              }
+              DTU_tr = c(DTU_tr, names(re1[order(re1,decreasing = T)[1]]))
+            }
+          }
+      }
+  }
+  res_df = data.frame(gene_name = ge_name,
+                    X_value = X_value,
+                    df=df,
+                    DTU_tr=DTU_tr,
+                    DTU_group=DTU_group,
+                    p_value=p_value,stringsAsFactors = FALSE)
+  res_df$adj_p=res_df$p_value*nrow(res_df)
+  res_df$adj_p=sapply(res_df$adj_p,function(x){min(1,x)})
+  res_df = res_df[order(res_df$p_value),]
+  return(res_df)
+}
+```
+
+```{r,warning=FALSE,message=FALSE}
+data_dir = "data/PromethION_scmixology2"
+result_mix2 = DTU_analysis(data_dir,file.path(data_dir,"FLTSA_output","transcript_count.csv.gz"),file.path(data_dir,"FLTSA_output","isoform_FSM_annotation.csv"))
+
+result_mix2_8 = DTU_analysis(data_dir,file.path(data_dir,"FLTSA_output","downsample","transcript_count_0.8.csv.gz"),file.path(data_dir,"FLTSA_output","downsample","isoform_FSM_annotation_0.8.csv"))
+result_mix2_6 = DTU_analysis(data_dir,file.path(data_dir,"FLTSA_output","downsample","transcript_count_0.6.csv.gz"),file.path(data_dir,"FLTSA_output","downsample","isoform_FSM_annotation_0.6.csv"))
+result_mix2_4 = DTU_analysis(data_dir,file.path(data_dir,"FLTSA_output","downsample","transcript_count_0.4.csv.gz"),file.path(data_dir,"FLTSA_output","downsample","isoform_FSM_annotation_0.4.csv"))
+result_mix2_2 = DTU_analysis(data_dir,file.path(data_dir,"FLTSA_output","downsample","transcript_count_0.2.csv.gz"),file.path(data_dir,"FLTSA_output","downsample","isoform_FSM_annotation_0.2.csv"))
+```
+
+
+```{r}
+table(result_mix2$adj_p<0.01)
+table(result_mix2_8$adj_p<0.01)
+table(result_mix2_6$adj_p<0.01)
+table(result_mix2_4$adj_p<0.01)
+table(result_mix2_2$adj_p<0.01)
+```
+
+```{r}
+390/673
+```
+
+
+```{r}
+mix2_ge = result_mix2$gene_name[result_mix2$adj_p<0.01]
+mix2_8_ge = result_mix2_8$gene_name[result_mix2_8$adj_p<0.01]
+mix2_6_ge = result_mix2_6$gene_name[result_mix2_6$adj_p<0.01]
+mix2_4_ge = result_mix2_4$gene_name[result_mix2_4$adj_p<0.01]
+mix2_2_ge = result_mix2_2$gene_name[result_mix2_2$adj_p<0.01]
+```
+
+```{r}
+all_ge = Reduce(union,list(mix2_ge,mix2_8_ge,mix2_6_ge,mix2_4_ge,mix2_2_ge))
+
+upset_df = data.frame(gene_id=all_ge,ratio_1=(all_ge %in% mix2_ge)*1,
+                      ratio_0.8 = (all_ge %in% mix2_8_ge)*1,
+                      ratio_0.6 = (all_ge %in% mix2_6_ge)*1,
+                      ratio_0.4 = (all_ge %in% mix2_4_ge)*1,
+                      ratio_0.2 = (all_ge %in% mix2_2_ge)*1)
+
+upset(upset_df, nsets = 10,order.by = "freq",nintersects=15,keep.order=TRUE,sets=rev(c('ratio_1', 'ratio_0.8','ratio_0.6', 'ratio_0.4', 'ratio_0.2')),
+mainbar.y.label="")
+
+pdf("figs/upset_plot_downsample_scmix2_DTU.pdf",width = 5,height = 3)
+upset(upset_df, nsets = 10,order.by = "freq",nintersects=15,keep.order=TRUE,sets=rev(c('ratio_1', 'ratio_0.8','ratio_0.6', 'ratio_0.4', 'ratio_0.2')),
+mainbar.y.label="number of DTU")
+dev.off()
+
+```
+
+
+```{r}
+TF_tr_typ = upset_df
+TF_tr_typ = TF_tr_typ %>% gather(smp,val,2:6)
+TF_tr_typ = TF_tr_typ %>% group_by(smp) %>% summarise(sum_val=sum(val))
+
+ggplot(data=TF_tr_typ,aes(x=smp,y=sum_val))+
+  geom_bar(alpha=0.8,stat="identity")+
+  #scale_fill_manual(values = c("cadetblue3","darkred"))+
+  labs(x="",y="number of transcripts")+
+  theme_bw()+blk_thm
+```
+
+
+```{r}
+get_bin_splicing_df = function(sub_ratio){
+  data_dir = "data/PromethION_scmixology2"
+  transcript_count <- read.csv(file.path(data_dir,"FLTSA_output","downsample",paste0( "transcript_count_",sub_ratio,".csv.gz")), stringsAsFactors=FALSE)
+  isoform_FSM_annotation <- read.csv(file.path(data_dir,"FLTSA_output","downsample",paste0( "isoform_FSM_annotation_",sub_ratio,".csv")) , stringsAsFactors=FALSE)
+  isoform_FSM_annotation = isoform_FSM_annotation[order(isoform_FSM_annotation$total_count,decreasing = T),]
+  transcript_count = transcript_count[match(isoform_FSM_annotation$transcript_id,transcript_count$transcript_id),]
+  transcript_count$FSM_match = isoform_FSM_annotation$FSM_match
+  cell_bcs = colnames(transcript_count)[!(colnames(transcript_count) %in% c("transcript_id","gene_id","FSM_match"))]
+  tr_anno = transcript_count[,c("transcript_id","gene_id","FSM_match")]
+  mer_tmp = transcript_count %>%
+    group_by(FSM_match) %>%
+    summarise_at(cell_bcs,sum)
+  
+  tr_anno = tr_anno[match(mer_tmp$FSM_match,tr_anno$FSM_match),]
+  tr_sce = SingleCellExperiment(assays=list(counts=as.matrix(mer_tmp[,-1]) ))
+  rownames(tr_sce) = mer_tmp$FSM_match
+  rowData(tr_sce) = DataFrame(tr_anno)
+  tr_sce = addPerCellQC(tr_sce)
+  tr_sce = addPerFeatureQC(tr_sce)
+  keep.hi <- isOutlier(tr_sce$sum, type="higher", log=TRUE)
+  keep.low <- isOutlier(tr_sce$sum, type="lower", log=TRUE)
+  tr_sce = tr_sce[,(!keep.hi) & (!keep.low)]
+  
+  rowData(tr_sce)$gene_id=gsub("\\..*","", rowData(tr_sce)$gene_id)
+  #gene_name = mapIds(org.Hs.eg.db,
+  #                   keys=rowData(tr_sce)$gene_id,
+  #                   column="SYMBOL",
+  #                   keytype="ENSEMBL",
+  #                   multiVals="first")
+  
+  #gene_name[is.na(gene_name)] = rowData(tr_sce)$gene_id[is.na(gene_name)]
+  rowData(tr_sce)$gene_name = rowData(tr_sce)$gene_id
+  
+  cluster_barcode_anno <- read.csv(file.path(data_dir,"cluster_annotation.csv"), stringsAsFactors=FALSE)
+  rownames(cluster_barcode_anno) = cluster_barcode_anno$barcode_seq
+  comm_cells = intersect(colnames(tr_sce),rownames(cluster_barcode_anno))
+  
+  tr_sce = tr_sce[,comm_cells]
+  cluster_barcode_anno = cluster_barcode_anno[comm_cells,]
+  colData(tr_sce) = cbind(colData(tr_sce),DataFrame(cluster_barcode_anno))
+  
+  tr_sce_multi = tr_sce[rowData(tr_sce)$gene_name %in% names( table(rowData(tr_sce)$gene_name)[ table(rowData(tr_sce)$gene_name)>1]), ]
+  
+  row_meta = as.data.frame(rowData(tr_sce_multi))
+  row_meta = row_meta %>% group_by(gene_name) %>% top_n(n = 20, wt = mean)
+  
+  tr_sce_multi = tr_sce_multi[rowData(tr_sce_multi)$transcript_id %in% row_meta$transcript_id,]
+  tr_sce_multi = logNormCounts(tr_sce_multi)
+  
+  gene_vec = unique(rowData(tr_sce_multi)$gene_id)
+  gene_cnt = c()
+  major_expr_prop = c()
+  mean_prop = c()
+  bin_prop = c()
+  gene_sel = c()
+  bn_logll = c()
+  #ran_bn_logll = c()
+  for (ge in gene_vec) {
+    tmp_cnt = counts(tr_sce_multi)[rowData(tr_sce_multi)$gene_id==ge,]
+    if(sum(tmp_cnt)>10 & !is.null(dim(tmp_cnt)) ){
+      if(sum(colSums(tmp_cnt)>0)<3){
+        next
+      }
+      gene_sel = c(gene_sel, ge)
+      gene_cnt = c(gene_cnt,sum(tmp_cnt))
+      tmp_cnt = tmp_cnt[order(rowSums(tmp_cnt),decreasing = T),]
+      tmp_cnt = tmp_cnt[,colSums(tmp_cnt)>0]
+      major_expr_prop = c(major_expr_prop, sum(tmp_cnt[1,])/sum(tmp_cnt))
+      #ran_cnt = rbinom(ncol(tmp_cnt),colSums(tmp_cnt),major_expr_prop)
+      #ran_pb = dbinom(ran_cnt, colSums(tmp_cnt), major_expr_prop, log = T)
+      pb = dbinom(0, colSums(tmp_cnt), major_expr_prop)+dbinom(colSums(tmp_cnt), colSums(tmp_cnt), major_expr_prop)
+      bn_logll = c(bn_logll,mean(pb))
+      #ran_bn_logll = c(ran_bn_logll, sum(ran_pb))
+      major_prop = tmp_cnt[1,]/colSums(tmp_cnt)
+      mean_prop = c(mean_prop, mean(major_prop))
+      bi = sum(major_prop==1 | major_prop==0)
+      bin_prop = c(bin_prop, bi/ncol(tmp_cnt))
+    }
+  }
+  result_df = data.frame(gene_id=gene_sel,
+                         gene_cnt=log2(gene_cnt),
+                         major_isoform_prop=major_expr_prop,
+                         mean_alt_prop=mean_prop,
+                         prop_binary=bin_prop,
+                         bn_logll=bn_logll,
+                         #ran_bn_logll=ran_bn_logll,
+                         stringsAsFactors = FALSE)
+return(result_df)
+}
+
+splice_df_8 = get_bin_splicing_df(0.8)
+splice_df_6 = get_bin_splicing_df(0.6)
+splice_df_4 = get_bin_splicing_df(0.4)
+splice_df_2 = get_bin_splicing_df(0.2)
+```
+
+```{r}
+library(ggpointdensity)
+```
+
+
+```{r,fig.width=7,fig.height=3}
+pp28 = ggplot(data=splice_df_8)+
+  geom_point(aes(x=gene_cnt,y=prop_binary,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  xlim(3.4,17.1)+
+  theme_bw()+blk_thm
+pp26 = ggplot(data=splice_df_6)+
+  geom_point(aes(x=gene_cnt,
+                          y=prop_binary,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  xlim(3.4,17.1)+
+  theme_bw()+blk_thm
+pp24 = ggplot(data=splice_df_4)+
+  geom_point(aes(x=gene_cnt,
+                          y=prop_binary,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  xlim(3.4,17.1)+
+  theme_bw()+blk_thm
+pp22 = ggplot(data=splice_df_2)+
+  geom_point(aes(x=gene_cnt,
+                          y=prop_binary,col=major_isoform_prop),size=0.2,alpha=0.5)+
+  labs(x="total gene counts (log2)",y="% with binary splicing",col="proportions of major isoform")+
+  geom_smooth(aes(x=gene_cnt,y=bn_logll),colour="black")+
+  xlim(3.4,17.1)+
+  theme_bw()+blk_thm
+ggarrange(pp2,pp28,pp26,pp24,pp22,common.legend = T,ncol=5,nrow=1,legend="bottom",align="hv")
+ggsave("figs/splicing_binary_downsample.pdf",width = 9.2,height = 2.3)
+```
+
